@@ -2,7 +2,7 @@
 local GITHUB_RAW = "https://raw.githubusercontent.com/ob-105/CC-tweaked-Audio-video-playback./main"
 local SELF_URL   = GITHUB_RAW .. "/player.lua"
 local SELF_PATH  = "player.lua"
-local VERSION    = "12"
+local VERSION    = "13"
 
 local function selfUpdate()
     print("[player] Checking for updates...")
@@ -60,12 +60,43 @@ local function loadManifest(name)
 end
 
 local function setupMonitor()
+    -- Try local first, then any monitor reachable over a wired network
     local mon = peripheral.find("monitor")
     if not mon then return nil end
     mon.setTextScale(0.5)
     local w, h = mon.getSize()
     print(("[player] Monitor: %dx%d"):format(w, h))
     return mon
+end
+
+local function findSpeakers()
+    -- Collect all speakers (local + networked via wired modem)
+    local found = {}
+    local seen  = {}
+    for _, s in ipairs({peripheral.find("speaker")}) do
+        local n = peripheral.getName(s)
+        if not seen[n] then seen[n] = true; found[#found+1] = s end
+    end
+    -- Also walk every wired modem and pull remote speakers
+    for _, side in ipairs(peripheral.getNames()) do
+        local p = peripheral.wrap(side)
+        if p and peripheral.getType(side) == "modem" and p.isWireless and not p.isWireless() then
+            -- wired modem: open it so remote names are visible
+            if p.open then pcall(p.open, 0) end
+            if p.getNamesOnNetwork then
+                for _, rname in ipairs(p.getNamesOnNetwork()) do
+                    if not seen[rname] then
+                        local rtype = p.getTypeOnSide and p.getTypeOnSide(rname)
+                        if rtype == "speaker" or peripheral.getType(rname) == "speaker" then
+                            local rs = peripheral.wrap(rname)
+                            if rs then seen[rname] = true; found[#found+1] = rs end
+                        end
+                    end
+                end
+            end
+        end
+    end
+    return found
 end
 
 local BLIT = "0123456789abcdef"
@@ -155,19 +186,25 @@ local function playMedia(mon, speakers, name, manifest)
 
     -- No pre-fetch burst: the rolling loop downloads ahead safely one frame at a time
     local t0 = os.clock()
+    local skipped = 0
     local function videoLoop()
         for frame = 1, count do
-            -- Wait for correct playback time
-            local wait = (frame - 1) / fps - (os.clock() - t0)
-            if wait > 0 then os.sleep(wait) end
+            local due = (frame - 1) / fps  -- seconds this frame is due
+            local elapsed = os.clock() - t0
+            -- If we're more than one frame period behind, skip rendering (keep audio sync)
             local p = framePath(frame)
-            -- Download current frame if not yet on disk
             if not fs.exists(p) then download(frameURL(frame), p) end
-            -- Render the frame
-            if fs.exists(p) and video then
-                local fh = fs.open(p, "r"); renderNFP(mon, fh.readAll()); fh.close()
+            if elapsed <= due + (1 / fps) then
+                -- On time (or close enough): wait if early, then render
+                local wait = due - elapsed
+                if wait > 0 then os.sleep(wait) end
+                if fs.exists(p) and video then
+                    local fh = fs.open(p, "r"); renderNFP(mon, fh.readAll()); fh.close()
+                end
+            else
+                -- Behind: skip render, catch up
+                skipped = skipped + 1
             end
-            -- Delete rendered frame immediately to free space
             if fs.exists(p) then fs.delete(p) end
             -- Download the next lookahead frame only if there is room
             local nx = frame + FRAME_BUFFER
@@ -175,6 +212,7 @@ local function playMedia(mon, speakers, name, manifest)
                 download(frameURL(nx), framePath(nx))
             end
         end
+        if skipped > 0 then print(("[player] Skipped %d frame(s) to maintain sync."):format(skipped)) end
     end
     local function audioLoop() if audio and #speakers > 0 then playAudio(speakers, name) end end
     if audio and video and count > 0 then parallel.waitForAll(audioLoop, videoLoop)
@@ -234,8 +272,8 @@ local function main()
         print("[player] Clearing media cache...")
         fs.delete("media")
     end
-    -- Collect all connected speakers
-    local speakers = {peripheral.find("speaker")}
+    -- Collect all connected speakers (local + networked)
+    local speakers = findSpeakers()
     if #speakers == 0 then print("[warn] No speakers found. Audio disabled.")
     else print(("[player] Found %d speaker(s)."):format(#speakers)) end
     local mon = setupMonitor()
