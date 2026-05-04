@@ -2,7 +2,7 @@
 local GITHUB_RAW = "https://raw.githubusercontent.com/ob-105/CC-tweaked-Audio-video-playback./main"
 local SELF_URL   = GITHUB_RAW .. "/player.lua"
 local SELF_PATH  = "player.lua"
-local VERSION    = "9"
+local VERSION    = "10"
 
 local function selfUpdate()
     print("[player] Checking for updates...")
@@ -172,6 +172,9 @@ local function playMedia(mon, speakers, name, manifest)
     if audio and video and count > 0 then parallel.waitForAll(audioLoop, videoLoop)
     elseif audio then audioLoop()
     elseif count > 0 then videoLoop() end
+    -- Clean up any leftover buffered frames (downloaded but not yet rendered)
+    local mediaDir = "media/"..name
+    if fs.exists(mediaDir) then fs.delete(mediaDir) end
     print("\n[player] Done. Press Enter..."); io.read()
 end
 
