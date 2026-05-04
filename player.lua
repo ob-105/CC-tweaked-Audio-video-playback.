@@ -14,7 +14,7 @@ local function selfUpdate()
     if not ok or not newData then print("[player] Offline, using local copy."); return end
     local remoteVer = newData:match('local VERSION%s*=%s*"(%d+)"')
     if not remoteVer then print("[player] Bad remote version."); return end
-    if remoteVer == VERSION then print("[player] Up to date (v"..VERSION..")."); return end
+    if tonumber(remoteVer) <= tonumber(VERSION) then print("[player] Up to date (v"..VERSION..")."); return end
     local f = fs.open(SELF_PATH, "w"); f.write(newData); f.close()
     print("[player] Updated to v"..remoteVer.."! Rebooting..."); os.sleep(0.5); os.reboot()
 end
