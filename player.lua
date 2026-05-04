@@ -2,7 +2,7 @@
 local GITHUB_RAW = "https://raw.githubusercontent.com/ob-105/CC-tweaked-Audio-video-playback./main"
 local SELF_URL   = GITHUB_RAW .. "/player.lua"
 local SELF_PATH  = "player.lua"
-local VERSION    = "13"
+local VERSION    = "14"
 
 local function selfUpdate()
     print("[player] Checking for updates...")
@@ -100,19 +100,13 @@ local function findSpeakers()
 end
 
 local BLIT = "0123456789abcdef"
-local function renderNFP(mon, nfp)
+local function renderLines(mon, lines)
     if not mon then return end
-    -- Parse NFP into a line table
-    local lines = {}
-    for line in (nfp.."\n"):gmatch("([^\n]*)\n") do
-        lines[#lines+1] = line
-    end
     local nh = #lines
     if nh == 0 then return end
     local nw = #lines[1]
     if nw == 0 then return end
     local mw, mh = mon.getSize()
-    -- Scale NFP to fill the entire monitor (stretch to fit)
     for row = 1, mh do
         local srcRow = math.max(1, math.min(nh, math.ceil(row * nh / mh)))
         local line   = lines[srcRow]
@@ -127,6 +121,27 @@ local function renderNFP(mon, nfp)
             end
         end
     end
+end
+
+local function renderNFP(mon, data)
+    if not mon then return end
+    local lines = {}
+    for line in (data.."\n"):gmatch("([^\n]*)\n") do lines[#lines+1] = line end
+    renderLines(mon, lines)
+end
+
+local function renderNFPC(mon, data)
+    if not mon then return end
+    local lines = {}
+    for rowstr in (data.."\n"):gmatch("([^\n]*)\n") do
+        local line = ""
+        for run in (rowstr.."|" ):gmatch("([^|]*)|" ) do
+            local c, n = run:match("^(.):(%d+)$")
+            if c and n then line = line .. c:rep(tonumber(n)) end
+        end
+        lines[#lines+1] = line
+    end
+    renderLines(mon, lines)
 end
 
 local function playAudio(speakers, name)
@@ -177,11 +192,12 @@ local function playMedia(mon, speakers, name, manifest)
         count, tostring(audio), tostring(video),
         #speakers, tostring(mon ~= nil)))
 
+    local fext = manifest.frame_ext or "nfp"
     local function framePath(i)
-        return "media/"..name.."/frames/"..("%06d.nfp"):format(i)
+        return ("media/%s/frames/%06d.%s"):format(name, i, fext)
     end
     local function frameURL(i)
-        return GITHUB_RAW.."/output/"..name.."/frames/"..("%06d.nfp"):format(i)
+        return ("%s/output/%s/frames/%06d.%s"):format(GITHUB_RAW, name, i, fext)
     end
 
     -- No pre-fetch burst: the rolling loop downloads ahead safely one frame at a time
@@ -199,7 +215,10 @@ local function playMedia(mon, speakers, name, manifest)
                 local wait = due - elapsed
                 if wait > 0 then os.sleep(wait) end
                 if fs.exists(p) and video then
-                    local fh = fs.open(p, "r"); renderNFP(mon, fh.readAll()); fh.close()
+                    local fh = fs.open(p, "r")
+                    local data = fh.readAll(); fh.close()
+                    if fext == "nfpc" then renderNFPC(mon, data)
+                    else renderNFP(mon, data) end
                 end
             else
                 -- Behind: skip render, catch up

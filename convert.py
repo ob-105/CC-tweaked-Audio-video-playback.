@@ -94,9 +94,31 @@ def image_to_nfp(img, width, height):
     return "\n".join("".join(row) for row in chars)
 
 
+def image_to_nfpc(img, width, height):
+    """Convert a PIL Image to RLE-compressed NFPC using vectorised numpy."""
+    img    = img.resize((width, height), Image.LANCZOS).convert("RGB")
+    pixels = np.array(img, dtype=np.int32)
+    diff   = pixels[:, :, np.newaxis, :] - _CC_PALETTE_NP
+    idx    = (diff ** 2).sum(axis=-1).argmin(axis=-1)
+    chars  = _NFP_CHARS_ARR[idx]
+    rows = []
+    for row in chars:
+        runs = []
+        cur = row[0]; count = 1
+        for c in row[1:]:
+            if c == cur:
+                count += 1
+            else:
+                runs.append(f"{cur}:{count}")
+                cur = c; count = 1
+        runs.append(f"{cur}:{count}")
+        rows.append("|".join(runs))
+    return "\n".join(rows)
+
+
 def _frame_worker(args):
-    """Top-level worker used by ProcessPoolExecutor for parallel NFP conversion."""
-    png_path, nfp_path, width, height = args
+    """Top-level worker used by ProcessPoolExecutor for parallel NFP/NFPC conversion."""
+    png_path, out_path, width, height, compress = args
     from PIL import Image as _Img
     import numpy as _np
     _pal  = _np.array(CC_PALETTE, dtype=_np.int32)
@@ -105,10 +127,26 @@ def _frame_worker(args):
     px    = _np.array(img, dtype=_np.int32)
     diff  = px[:, :, _np.newaxis, :] - _pal
     idx   = (diff ** 2).sum(axis=-1).argmin(axis=-1)
-    nfp   = "\n".join("".join(row) for row in _ch[idx])
-    with open(nfp_path, "w") as f:
-        f.write(nfp)
-    return nfp_path
+    char_grid = _ch[idx]
+    if compress:
+        rows = []
+        for row in char_grid:
+            runs = []
+            cur = row[0]; count = 1
+            for c in row[1:]:
+                if c == cur:
+                    count += 1
+                else:
+                    runs.append(f"{cur}:{count}")
+                    cur = c; count = 1
+            runs.append(f"{cur}:{count}")
+            rows.append("|".join(runs))
+        data = "\n".join(rows)
+    else:
+        data = "\n".join("".join(row) for row in char_grid)
+    with open(out_path, "w") as f:
+        f.write(data)
+    return out_path
 
 
 # ---------------------------------------------------------------------------
@@ -198,9 +236,10 @@ def convert_audio_to_dfpwm(input_path, output_path):
     return duration_seconds
 
 
-def extract_frames(input_path, frames_dir, fps, width, height):
-    """Extract video frames from MP4 and convert to NFP."""
-    print(f"  Extracting frames at {fps} FPS ({width}x{height})...")
+def extract_frames(input_path, frames_dir, fps, width, height, compress=False):
+    """Extract video frames from MP4 and convert to NFP or NFPC."""
+    ext = "nfpc" if compress else "nfp"
+    print(f"  Extracting frames at {fps} FPS ({width}x{height}) [{ext}]...")
     os.makedirs(frames_dir, exist_ok=True)
 
     with tempfile.TemporaryDirectory() as tmp_dir:
@@ -225,9 +264,10 @@ def extract_frames(input_path, frames_dir, fps, width, height):
         worker_args = [
             (
                 os.path.join(tmp_dir, pf),
-                os.path.join(frames_dir, f"{i + 1:06d}.nfp"),
+                os.path.join(frames_dir, f"{i + 1:06d}.{ext}"),
                 width,
                 height,
+                compress,
             )
             for i, pf in enumerate(png_files)
         ]
@@ -312,7 +352,7 @@ def git_push(message):
 # ---------------------------------------------------------------------------
 # Convert a single file
 # ---------------------------------------------------------------------------
-def convert_file(input_path, fps, monitors_x, monitors_y):
+def convert_file(input_path, fps, monitors_x, monitors_y, compress=False):
     monitor_w = 51
     monitor_h = 19
     width  = monitor_w * monitors_x
@@ -342,6 +382,7 @@ def convert_file(input_path, fps, monitors_x, monitors_y):
         "height": height,
         "monitors_x": monitors_x,
         "monitors_y": monitors_y,
+        "frame_ext": "nfpc" if compress else "nfp",
     }
 
     audio_path = os.path.join(output_dir, "audio.dfpwm")
@@ -350,7 +391,7 @@ def convert_file(input_path, fps, monitors_x, monitors_y):
 
     if is_video:
         frames_dir = os.path.join(output_dir, "frames")
-        frame_count = extract_frames(input_path, frames_dir, fps, width, height)
+        frame_count = extract_frames(input_path, frames_dir, fps, width, height, compress)
         manifest["frame_count"] = frame_count
     else:
         manifest["has_video"] = "false"
@@ -421,9 +462,13 @@ def launch_gui():
     var_my.trace_add("write", update_res_label)
     update_res_label()
 
+    var_compress = tk.BooleanVar(value=True)
+    ttk.Checkbutton(sf, text="Compress frames with RLE (smaller files, faster downloads)",
+                    variable=var_compress).grid(row=3, column=0, columnspan=5, sticky="w", pady=(6, 0))
+
     var_push = tk.BooleanVar(value=True)
     ttk.Checkbutton(sf, text="Auto-push to GitHub after converting", variable=var_push).grid(
-        row=3, column=0, columnspan=5, sticky="w", pady=(6, 0))
+        row=4, column=0, columnspan=5, sticky="w", pady=(2, 0))
 
     # ── File list ─────────────────────────────────────────────────────────
     ff = ttk.LabelFrame(root, text="Files in  input/", padding=10)
@@ -494,8 +539,9 @@ def launch_gui():
             print(f"=== Converting {len(files)} file(s) ===")
             video_list, audio_list = load_index()
             converted = []
+            compress = var_compress.get()
             for input_path in files:
-                media_name, is_video = convert_file(input_path, fps, mx, my)
+                media_name, is_video = convert_file(input_path, fps, mx, my, compress)
                 if is_video:
                     if media_name not in video_list:
                         video_list.append(media_name)
@@ -536,6 +582,7 @@ def main():
         parser.add_argument("--monitors-x", type=int, default=3)
         parser.add_argument("--monitors-y", type=int, default=2)
         parser.add_argument("--no-push",    action="store_true")
+        parser.add_argument("--compress",   action="store_true", help="Use RLE frame compression")
         args = parser.parse_args()
 
         if shutil.which("ffmpeg") is None:
@@ -556,7 +603,7 @@ def main():
         video_list, audio_list = load_index()
         converted = []
         for input_path in files:
-            media_name, is_video = convert_file(input_path, args.fps, args.monitors_x, args.monitors_y)
+            media_name, is_video = convert_file(input_path, args.fps, args.monitors_x, args.monitors_y, args.compress)
             if is_video:
                 if media_name not in video_list:
                     video_list.append(media_name)
