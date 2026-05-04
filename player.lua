@@ -2,7 +2,7 @@
 local GITHUB_RAW = "https://raw.githubusercontent.com/ob-105/CC-tweaked-Audio-video-playback./main"
 local SELF_URL   = GITHUB_RAW .. "/player.lua"
 local SELF_PATH  = "player.lua"
-local VERSION    = "5"
+local VERSION    = "6"
 
 local function selfUpdate()
     print("[player] Checking for updates...")
@@ -88,9 +88,9 @@ local function renderNFP(mon, nfp)
     end
 end
 
-local function playAudio(speaker, name)
+local function playAudio(speakers, name)
     local url = GITHUB_RAW .. "/output/" .. name .. "/audio.dfpwm"
-    print("[player] Streaming audio...")
+    print(("[player] Streaming audio on %d speaker(s)..."):format(#speakers))
     local res = http.get(url, nil, true)
     if not res then print("[player] Audio fetch failed."); return end
     local dfpwm = require("cc.audio.dfpwm")
@@ -99,20 +99,28 @@ local function playAudio(speaker, name)
         local chunk = res.read(16384)
         if not chunk then break end
         local pcm = decoder(chunk)
-        while not speaker.playAudio(pcm) do os.pullEvent("speaker_audio_empty") end
+        -- Play to all speakers simultaneously; wait if any is busy
+        local busy = true
+        while busy do
+            busy = false
+            for _, spk in ipairs(speakers) do
+                if not spk.playAudio(pcm) then busy = true end
+            end
+            if busy then os.pullEvent("speaker_audio_empty") end
+        end
     end
     res.close()
 end
 
-local function playMedia(mon, speaker, name, manifest)
+local function playMedia(mon, speakers, name, manifest)
     local fps   = manifest.fps or 5
     local count = manifest.frame_count or 0
     local audio = manifest.has_audio == "true"
     local video = manifest.has_video == "true" and mon ~= nil
     print(("[player] Playing '%s'"):format(name))
-    print(("[player] frames=%d  audio=%s  video=%s  speaker=%s  monitor=%s"):format(
+    print(("[player] frames=%d  audio=%s  video=%s  speakers=%d  monitor=%s"):format(
         count, tostring(audio), tostring(video),
-        tostring(speaker ~= nil), tostring(mon ~= nil)))
+        #speakers, tostring(mon ~= nil)))
     local pre = math.min(10, count)
     if video and count > 0 then
         print(("[player] Pre-fetching %d frames..."):format(pre))
@@ -140,7 +148,7 @@ local function playMedia(mon, speaker, name, manifest)
             frame = frame + 1
         end
     end
-    local function audioLoop() if audio and speaker then playAudio(speaker, name) end end
+    local function audioLoop() if audio and #speakers > 0 then playAudio(speakers, name) end end
     if audio and video and count > 0 then parallel.waitForAll(audioLoop, videoLoop)
     elseif audio then audioLoop()
     elseif count > 0 then videoLoop() end
@@ -190,8 +198,10 @@ local function main()
     term.clear(); term.setCursorPos(1,1)
     print("=== CC:Tweaked Media Player ==="); print()
     selfUpdate()
-    local speaker = peripheral.find("speaker")
-    if not speaker then print("[warn] No speaker found.") end
+    -- Collect all connected speakers
+    local speakers = {peripheral.find("speaker")}
+    if #speakers == 0 then print("[warn] No speakers found. Audio disabled.")
+    else print(("[player] Found %d speaker(s)."):format(#speakers)) end
     local mon = setupMonitor()
     local idx = loadIndex()
     while true do
@@ -201,7 +211,7 @@ local function main()
         elseif action == "play" and pick then
             local ok, manifest = pcall(loadManifest, pick)
             if not ok then print("[error] "..tostring(manifest)); print("Press Enter..."); io.read()
-            else playMedia(mon, speaker, pick, manifest) end
+            else playMedia(mon, speakers, pick, manifest) end
         end
     end
 end

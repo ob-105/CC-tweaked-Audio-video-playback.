@@ -157,39 +157,38 @@ def pcm_to_dfpwm(pcm_bytes):
 def convert_audio_to_dfpwm(input_path, output_path):
     """Use ffmpeg to extract & resample audio, then encode to DFPWM."""
     print(f"  Converting audio → DFPWM...")
-    with tempfile.NamedTemporaryFile(suffix=".raw", delete=False) as tmp:
-        tmp_path = tmp.name
 
+    # Get duration first
+    result = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+         "-of", "default=noprint_wrappers=1:nokey=1", input_path],
+        capture_output=True, text=True
+    )
     try:
-        # Extract audio as raw signed 8-bit mono 48000 Hz PCM
-        subprocess.run(
-            [
-                "ffmpeg", "-y",
-                "-i", input_path,
-                "-ar", "48000",
-                "-ac", "1",
-                "-f", "u8",   # unsigned 8-bit
-                tmp_path,
-            ],
-            check=True,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
+        duration_seconds = float(result.stdout.strip())
+    except Exception:
+        duration_seconds = 0.0
 
-        with open(tmp_path, "rb") as f:
-            pcm_data = f.read()
+    # Use ffmpeg's native DFPWM encoder for best quality
+    subprocess.run(
+        [
+            "ffmpeg", "-y",
+            "-i", input_path,
+            "-af", "aresample=48000,pan=mono|c0=0.5*c0+0.5*c1",
+            "-ar", "48000",
+            "-ac", "1",
+            "-c:a", "dfpwm",
+            "-f", "dfpwm",
+            output_path,
+        ],
+        check=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
 
-        dfpwm_data = pcm_to_dfpwm(pcm_data)
-
-        with open(output_path, "wb") as f:
-            f.write(dfpwm_data)
-
-        duration_seconds = len(pcm_data) / 48000
-        print(f"  Audio: {len(dfpwm_data):,} bytes, {duration_seconds:.1f}s")
-        return duration_seconds
-
-    finally:
-        os.unlink(tmp_path)
+    size = os.path.getsize(output_path)
+    print(f"  Audio: {size:,} bytes, {duration_seconds:.1f}s")
+    return duration_seconds
 
 
 def extract_frames(input_path, frames_dir, fps, width, height):
