@@ -5,9 +5,9 @@ return {
   has_video = "true",
   fps = 5,
   frame_count = 1299,
-  width = 153,
-  height = 38,
-  monitors_x = 3,
-  monitors_y = 2,
+  width = 408,
+  height = 114,
+  monitors_x = 8,
+  monitors_y = 6,
   duration = 259.76,
 }
