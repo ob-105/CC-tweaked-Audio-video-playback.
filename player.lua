@@ -2,7 +2,7 @@
 local GITHUB_RAW = "https://raw.githubusercontent.com/ob-105/CC-tweaked-Audio-video-playback./main"
 local SELF_URL   = GITHUB_RAW .. "/player.lua"
 local SELF_PATH  = "player.lua"
-local VERSION    = "6"
+local VERSION    = "8"
 
 local function selfUpdate()
     print("[player] Checking for updates...")
@@ -112,6 +112,8 @@ local function playAudio(speakers, name)
     res.close()
 end
 
+local FRAME_BUFFER = 25  -- max frames kept on disk at once
+
 local function playMedia(mon, speakers, name, manifest)
     local fps   = manifest.fps or 5
     local count = manifest.frame_count or 0
@@ -121,31 +123,39 @@ local function playMedia(mon, speakers, name, manifest)
     print(("[player] frames=%d  audio=%s  video=%s  speakers=%d  monitor=%s"):format(
         count, tostring(audio), tostring(video),
         #speakers, tostring(mon ~= nil)))
-    local pre = math.min(10, count)
-    if video and count > 0 then
-        print(("[player] Pre-fetching %d frames..."):format(pre))
-        for i = 1, pre do
-            local f = ("%06d.nfp"):format(i)
-            download(GITHUB_RAW.."/output/"..name.."/frames/"..f, "media/"..name.."/frames/"..f)
-        end
+
+    local function framePath(i)
+        return "media/"..name.."/frames/"..("%06d.nfp"):format(i)
     end
-    local t0 = os.clock(); local frame = 1
+    local function frameURL(i)
+        return GITHUB_RAW.."/output/"..name.."/frames/"..("%06d.nfp"):format(i)
+    end
+
+    -- Pre-fetch initial buffer before playback starts
+    if video and count > 0 then
+        local pre = math.min(FRAME_BUFFER, count)
+        print(("[player] Buffering %d frames..."):format(pre))
+        for i = 1, pre do download(frameURL(i), framePath(i)) end
+    end
+
+    local t0 = os.clock()
     local function videoLoop()
-        while frame <= count do
-            local wait = (frame-1)/fps - (os.clock()-t0)
+        for frame = 1, count do
+            -- Wait for correct playback time
+            local wait = (frame - 1) / fps - (os.clock() - t0)
             if wait > 0 then os.sleep(wait) end
-            local f = ("%06d.nfp"):format(frame)
-            local p = "media/"..name.."/frames/"..f
-            if not fs.exists(p) then download(GITHUB_RAW.."/output/"..name.."/frames/"..f, p) end
+            local p = framePath(frame)
+            -- Download if somehow not buffered yet
+            if not fs.exists(p) then download(frameURL(frame), p) end
+            -- Render the frame
             if fs.exists(p) and video then
                 local fh = fs.open(p, "r"); renderNFP(mon, fh.readAll()); fh.close()
             end
-            local nx = frame + pre
-            if nx <= count then
-                local nf = "media/"..name.."/frames/"..("%06d.nfp"):format(nx)
-                if not fs.exists(nf) then download(GITHUB_RAW.."/output/"..name.."/frames/"..("%06d.nfp"):format(nx), nf) end
-            end
-            frame = frame + 1
+            -- Delete rendered frame immediately to free space
+            if fs.exists(p) then fs.delete(p) end
+            -- Download the next frame that falls outside the already-buffered window
+            local nx = frame + FRAME_BUFFER
+            if nx <= count then download(frameURL(nx), framePath(nx)) end
         end
     end
     local function audioLoop() if audio and #speakers > 0 then playAudio(speakers, name) end end
