@@ -198,6 +198,11 @@ local function main()
     term.clear(); term.setCursorPos(1,1)
     print("=== CC:Tweaked Media Player ==="); print()
     selfUpdate()
+    -- Wipe cached media to free disk space before each session
+    if fs.exists("media") then
+        print("[player] Clearing media cache...")
+        fs.delete("media")
+    end
     -- Collect all connected speakers
     local speakers = {peripheral.find("speaker")}
     if #speakers == 0 then print("[warn] No speakers found. Audio disabled.")
