@@ -2,7 +2,7 @@
 local GITHUB_RAW = "https://raw.githubusercontent.com/ob-105/CC-tweaked-Audio-video-playback./main"
 local SELF_URL   = GITHUB_RAW .. "/player.lua"
 local SELF_PATH  = "player.lua"
-local VERSION    = "11"
+local VERSION    = "12"
 
 local function selfUpdate()
     print("[player] Checking for updates...")
@@ -153,13 +153,7 @@ local function playMedia(mon, speakers, name, manifest)
         return GITHUB_RAW.."/output/"..name.."/frames/"..("%06d.nfp"):format(i)
     end
 
-    -- Pre-fetch initial buffer before playback starts
-    if video and count > 0 then
-        local pre = math.min(FRAME_BUFFER, count)
-        print(("[player] Buffering %d frames..."):format(pre))
-        for i = 1, pre do download(frameURL(i), framePath(i)) end
-    end
-
+    -- No pre-fetch burst: the rolling loop downloads ahead safely one frame at a time
     local t0 = os.clock()
     local function videoLoop()
         for frame = 1, count do
@@ -167,7 +161,7 @@ local function playMedia(mon, speakers, name, manifest)
             local wait = (frame - 1) / fps - (os.clock() - t0)
             if wait > 0 then os.sleep(wait) end
             local p = framePath(frame)
-            -- Download if somehow not buffered yet
+            -- Download current frame if not yet on disk
             if not fs.exists(p) then download(frameURL(frame), p) end
             -- Render the frame
             if fs.exists(p) and video then
@@ -175,9 +169,11 @@ local function playMedia(mon, speakers, name, manifest)
             end
             -- Delete rendered frame immediately to free space
             if fs.exists(p) then fs.delete(p) end
-            -- Download the next frame that falls outside the already-buffered window
+            -- Download the next lookahead frame only if there is room
             local nx = frame + FRAME_BUFFER
-            if nx <= count then download(frameURL(nx), framePath(nx)) end
+            if nx <= count and fs.getFreeSpace("/") > 400 * 1024 then
+                download(frameURL(nx), framePath(nx))
+            end
         end
     end
     local function audioLoop() if audio and #speakers > 0 then playAudio(speakers, name) end end
