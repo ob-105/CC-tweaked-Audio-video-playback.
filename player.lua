@@ -1,4 +1,4 @@
-﻿-- CC:Tweaked Media Player
+-- CC:Tweaked Media Player
 -- Plays DFPWM audio through a speaker and renders NFP video frames on a monitor array.
 -- Auto-updates itself from GitHub on launch.
 --
