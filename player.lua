@@ -10,9 +10,10 @@
 local GITHUB_RAW = "https://raw.githubusercontent.com/ob-105/CC-tweaked-Audio-video-playback./main"
 local SELF_URL   = GITHUB_RAW .. "/player.lua"
 local SELF_PATH  = "player.lua"
+local VERSION    = "3"  -- increment this to trigger an update
 
 -- ---------------------------------------------------------------------------
--- Self-update (only reboots if file actually changed)
+-- Self-update (uses version number to avoid CRLF comparison issues)
 -- ---------------------------------------------------------------------------
 local function selfUpdate()
     print("[player] Checking for updates...")
@@ -27,20 +28,21 @@ local function selfUpdate()
         print("[player] Could not reach GitHub, running local copy.")
         return
     end
-    local currentData = ""
-    if fs.exists(SELF_PATH) then
-        local f = fs.open(SELF_PATH, "r")
-        currentData = f.readAll()
-        f.close()
-    end
-    if newData == currentData then
-        print("[player] Already up to date.")
+    -- Extract version from downloaded file
+    local remoteVer = newData:match('local VERSION%s*=%s*"(%d+)"')
+    if not remoteVer then
+        print("[player] Could not read remote version, skipping update.")
         return
     end
+    if remoteVer == VERSION then
+        print("[player] Already up to date (v" .. VERSION .. ").")
+        return
+    end
+    -- Write new version and reboot
     local f = fs.open(SELF_PATH, "w")
     f.write(newData)
     f.close()
-    print("[player] Updated! Rebooting...")
+    print("[player] Updated to v" .. remoteVer .. "! Rebooting...")
     os.sleep(0.5)
     os.reboot()
 end
