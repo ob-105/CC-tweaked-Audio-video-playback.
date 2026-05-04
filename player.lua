@@ -2,7 +2,7 @@
 local GITHUB_RAW = "https://raw.githubusercontent.com/ob-105/CC-tweaked-Audio-video-playback./main"
 local SELF_URL   = GITHUB_RAW .. "/player.lua"
 local SELF_PATH  = "player.lua"
-local VERSION    = "10"
+local VERSION    = "11"
 
 local function selfUpdate()
     print("[player] Checking for updates...")
@@ -122,14 +122,26 @@ local function playAudio(speakers, name)
     res.close()
 end
 
-local FRAME_BUFFER = 25  -- max frames kept on disk at once
+local function calcBuffer(manifest)
+    -- Each NFP frame is (width + 1) * height bytes (chars + newlines)
+    local fw = manifest.width  or 51
+    local fh = manifest.height or 19
+    local frame_bytes = (fw + 1) * fh
+    -- Leave 200 KB headroom for the OS, player.lua and index files
+    local free = fs.getFreeSpace("/") - 200 * 1024
+    if free <= 0 then return 1 end
+    -- Use at most half the remaining free space for the frame buffer
+    local buf = math.floor((free / 2) / frame_bytes)
+    return math.max(1, math.min(buf, 60))  -- clamp: at least 1, at most 60
+end
 
 local function playMedia(mon, speakers, name, manifest)
     local fps   = manifest.fps or 5
     local count = manifest.frame_count or 0
     local audio = manifest.has_audio == "true"
     local video = manifest.has_video == "true" and mon ~= nil
-    print(("[player] Playing '%s'"):format(name))
+    local FRAME_BUFFER = calcBuffer(manifest)
+    print(("[player] Playing '%s'  buffer=%d frames"):format(name, FRAME_BUFFER))
     print(("[player] frames=%d  audio=%s  video=%s  speakers=%d  monitor=%s"):format(
         count, tostring(audio), tostring(video),
         #speakers, tostring(mon ~= nil)))
