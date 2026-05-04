@@ -347,70 +347,214 @@ def convert_file(input_path, fps, monitors_x, monitors_y):
 
 
 # ---------------------------------------------------------------------------
+# GUI
+# ---------------------------------------------------------------------------
+def launch_gui():
+    import tkinter as tk
+    from tkinter import ttk, scrolledtext
+    import threading
+    import queue
+
+    MONITOR_W = 51  # chars per monitor at text scale 0.5
+    MONITOR_H = 19
+
+    log_queue = queue.Queue()
+
+    class QueueWriter:
+        """Thread-safe stdout redirect to the log queue."""
+        def write(self, s):
+            if s and s.strip():
+                log_queue.put(s.rstrip())
+        def flush(self):
+            pass
+
+    root = tk.Tk()
+    root.title("CC:Tweaked Media Converter")
+    root.resizable(False, False)
+
+    # ── Settings ──────────────────────────────────────────────────────────
+    sf = ttk.LabelFrame(root, text="Monitor & Quality Settings", padding=10)
+    sf.grid(row=0, column=0, padx=12, pady=(12, 4), sticky="ew")
+
+    ttk.Label(sf, text="Monitors wide:").grid(row=0, column=0, sticky="w", pady=2)
+    var_mx = tk.IntVar(value=3)
+    ttk.Spinbox(sf, from_=1, to=8, textvariable=var_mx, width=5).grid(row=0, column=1, padx=(6,16), pady=2)
+
+    ttk.Label(sf, text="Monitors tall:").grid(row=0, column=2, sticky="w", pady=2)
+    var_my = tk.IntVar(value=2)
+    ttk.Spinbox(sf, from_=1, to=8, textvariable=var_my, width=5).grid(row=0, column=3, padx=(6,0), pady=2)
+
+    ttk.Label(sf, text="FPS:").grid(row=1, column=0, sticky="w", pady=2)
+    var_fps = tk.IntVar(value=5)
+    ttk.Spinbox(sf, from_=1, to=30, textvariable=var_fps, width=5).grid(row=1, column=1, padx=(6,16), pady=2)
+
+    ttk.Label(sf, text="Speakers:").grid(row=1, column=2, sticky="w", pady=2)
+    var_spk = tk.IntVar(value=1)
+    ttk.Spinbox(sf, from_=1, to=16, textvariable=var_spk, width=5).grid(row=1, column=3, padx=(6,0), pady=2)
+    ttk.Label(sf, text="(auto-detected in-game)", foreground="gray").grid(row=1, column=4, sticky="w", padx=6)
+
+    res_label = ttk.Label(sf, foreground="#555")
+    res_label.grid(row=2, column=0, columnspan=5, sticky="w", pady=(4, 0))
+
+    def update_res_label(*_):
+        w = var_mx.get() * MONITOR_W
+        h = var_my.get() * MONITOR_H
+        res_label.configure(text=f"→ Video resolution: {w} × {h} chars")
+
+    var_mx.trace_add("write", update_res_label)
+    var_my.trace_add("write", update_res_label)
+    update_res_label()
+
+    var_push = tk.BooleanVar(value=True)
+    ttk.Checkbutton(sf, text="Auto-push to GitHub after converting", variable=var_push).grid(
+        row=3, column=0, columnspan=5, sticky="w", pady=(6, 0))
+
+    # ── File list ─────────────────────────────────────────────────────────
+    ff = ttk.LabelFrame(root, text="Files in  input/", padding=10)
+    ff.grid(row=1, column=0, padx=12, pady=4, sticky="ew")
+
+    lb = tk.Listbox(ff, height=5, width=58, selectmode="extended")
+    lb.grid(row=0, column=0, columnspan=2)
+
+    def refresh_files():
+        lb.delete(0, tk.END)
+        os.makedirs("input", exist_ok=True)
+        for f in sorted(os.listdir("input")):
+            if os.path.splitext(f)[1].lower() in (".mp3", ".mp4"):
+                lb.insert(tk.END, f)
+
+    refresh_files()
+    ttk.Button(ff, text="Refresh list", command=refresh_files).grid(row=1, column=0, pady=(6,0), sticky="w")
+
+    # ── Log ───────────────────────────────────────────────────────────────
+    lf = ttk.LabelFrame(root, text="Log", padding=10)
+    lf.grid(row=2, column=0, padx=12, pady=4, sticky="ew")
+
+    log_box = scrolledtext.ScrolledText(lf, height=12, width=70, state="disabled",
+                                        font=("Consolas", 9))
+    log_box.grid(row=0, column=0)
+
+    def append_log(msg):
+        log_box.configure(state="normal")
+        log_box.insert(tk.END, msg + "\n")
+        log_box.see(tk.END)
+        log_box.configure(state="disabled")
+
+    def poll_log():
+        while not log_queue.empty():
+            append_log(log_queue.get_nowait())
+        root.after(100, poll_log)
+
+    root.after(100, poll_log)
+
+    # ── Convert button ────────────────────────────────────────────────────
+    btn = ttk.Button(root, text="▶  Convert & Push", width=22)
+    btn.grid(row=3, column=0, pady=(4, 14))
+
+    def run_conversion():
+        btn.configure(state="disabled")
+        old_stdout = sys.stdout
+        sys.stdout = QueueWriter()
+        try:
+            if shutil.which("ffmpeg") is None:
+                print("Error: ffmpeg not found on PATH.")
+                return
+
+            fps = var_fps.get()
+            mx  = var_mx.get()
+            my  = var_my.get()
+            do_push = var_push.get()
+
+            supported = (".mp3", ".mp4")
+            files = [
+                os.path.join("input", f)
+                for f in os.listdir("input")
+                if os.path.splitext(f)[1].lower() in supported
+            ]
+            if not files:
+                print("No MP3 or MP4 files found in input/")
+                return
+
+            print(f"=== Converting {len(files)} file(s) ===")
+            video_list, audio_list = load_index()
+            converted = []
+            for input_path in files:
+                media_name, is_video = convert_file(input_path, fps, mx, my)
+                if is_video:
+                    if media_name not in video_list:
+                        video_list.append(media_name)
+                else:
+                    if media_name not in audio_list:
+                        audio_list.append(media_name)
+                converted.append(os.path.basename(input_path))
+
+            save_index(video_list, audio_list)
+            print(f"Index updated.  Videos: {video_list}  Audio: {audio_list}")
+
+            if do_push:
+                git_push("Convert: " + ", ".join(converted))
+
+            print("All done!  In CC:T run  lua player.lua  to play.")
+        except Exception as e:
+            print(f"Error: {e}")
+        finally:
+            sys.stdout = old_stdout
+            root.after(0, lambda: btn.configure(state="normal"))
+
+    def start():
+        threading.Thread(target=run_conversion, daemon=True).start()
+
+    btn.configure(command=start)
+    root.mainloop()
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 def main():
-    parser = argparse.ArgumentParser(description="Batch convert MP3/MP4 for CC:Tweaked playback")
-    parser.add_argument("--fps",         type=int, default=5, help="Video FPS (default: 5)")
-    parser.add_argument("--monitors-x",  type=int, default=3, help="Monitors wide (default: 3)")
-    parser.add_argument("--monitors-y",  type=int, default=2, help="Monitors tall (default: 2)")
-    parser.add_argument("--no-push",     action="store_true", help="Skip git push")
-    args = parser.parse_args()
+    # CLI fallback: python convert.py --no-gui [options]
+    if "--no-gui" in sys.argv:
+        sys.argv.remove("--no-gui")
+        parser = argparse.ArgumentParser(description="CC:Tweaked Media Converter (CLI mode)")
+        parser.add_argument("--fps",        type=int, default=5)
+        parser.add_argument("--monitors-x", type=int, default=3)
+        parser.add_argument("--monitors-y", type=int, default=2)
+        parser.add_argument("--no-push",    action="store_true")
+        args = parser.parse_args()
 
-    # Check ffmpeg
-    if shutil.which("ffmpeg") is None:
-        print("Error: ffmpeg not found on PATH.")
-        print("Download from https://ffmpeg.org/download.html and add to PATH.")
-        sys.exit(1)
+        if shutil.which("ffmpeg") is None:
+            print("Error: ffmpeg not found on PATH.")
+            sys.exit(1)
 
-    input_dir = "input"
-    os.makedirs(input_dir, exist_ok=True)
+        os.makedirs("input", exist_ok=True)
+        supported = (".mp3", ".mp4")
+        files = [
+            os.path.join("input", f)
+            for f in os.listdir("input")
+            if os.path.splitext(f)[1].lower() in supported
+        ]
+        if not files:
+            print("No MP3 or MP4 files found in input/")
+            sys.exit(0)
 
-    # Find all MP3/MP4 files in input/
-    supported = (".mp3", ".mp4")
-    files = [
-        os.path.join(input_dir, f)
-        for f in os.listdir(input_dir)
-        if os.path.splitext(f)[1].lower() in supported
-    ]
+        video_list, audio_list = load_index()
+        converted = []
+        for input_path in files:
+            media_name, is_video = convert_file(input_path, args.fps, args.monitors_x, args.monitors_y)
+            if is_video:
+                if media_name not in video_list:
+                    video_list.append(media_name)
+            else:
+                if media_name not in audio_list:
+                    audio_list.append(media_name)
+            converted.append(os.path.basename(input_path))
 
-    if not files:
-        print(f"No MP3 or MP4 files found in '{input_dir}/'.")
-        print("Drop your files into the 'input' folder and run again.")
-        sys.exit(0)
-
-    print(f"\n=== CC:Tweaked Media Converter ===")
-    print(f"Found {len(files)} file(s) to convert.\n")
-
-    # Load existing index
-    video_list, audio_list = load_index()
-
-    converted = []
-    for input_path in files:
-        media_name, is_video = convert_file(
-            input_path, args.fps, args.monitors_x, args.monitors_y
-        )
-        # Add to index if not already there
-        if is_video:
-            if media_name not in video_list:
-                video_list.append(media_name)
-        else:
-            if media_name not in audio_list:
-                audio_list.append(media_name)
-        converted.append(os.path.basename(input_path))
-
-    # Save updated index
-    save_index(video_list, audio_list)
-    print(f"\nIndex updated → output/index.lua")
-    print(f"  Videos: {video_list}")
-    print(f"  Audio:  {audio_list}")
-
-    # Auto git push
-    if not args.no_push:
-        msg = "Convert: " + ", ".join(converted)
-        git_push(msg)
-
-    print("\nAll done! In CC:T run  lua player.lua  to browse and play.")
+        save_index(video_list, audio_list)
+        if not args.no_push:
+            git_push("Convert: " + ", ".join(converted))
+        print("All done!")
+    else:
+        launch_gui()
 
 
 if __name__ == "__main__":

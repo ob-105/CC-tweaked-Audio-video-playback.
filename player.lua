@@ -2,7 +2,7 @@
 local GITHUB_RAW = "https://raw.githubusercontent.com/ob-105/CC-tweaked-Audio-video-playback./main"
 local SELF_URL   = GITHUB_RAW .. "/player.lua"
 local SELF_PATH  = "player.lua"
-local VERSION    = "8"
+local VERSION    = "9"
 
 local function selfUpdate()
     print("[player] Checking for updates...")
@@ -71,20 +71,30 @@ end
 local BLIT = "0123456789abcdef"
 local function renderNFP(mon, nfp)
     if not mon then return end
-    local mw, mh = mon.getSize()
-    local row = 1
+    -- Parse NFP into a line table
+    local lines = {}
     for line in (nfp.."\n"):gmatch("([^\n]*)\n") do
-        if row > mh then break end
-        for col = 1, math.min(#line, mw) do
-            local c = line:sub(col, col)
+        lines[#lines+1] = line
+    end
+    local nh = #lines
+    if nh == 0 then return end
+    local nw = #lines[1]
+    if nw == 0 then return end
+    local mw, mh = mon.getSize()
+    -- Scale NFP to fill the entire monitor (stretch to fit)
+    for row = 1, mh do
+        local srcRow = math.max(1, math.min(nh, math.ceil(row * nh / mh)))
+        local line   = lines[srcRow]
+        for col = 1, mw do
+            local srcCol = math.max(1, math.min(nw, math.ceil(col * nw / mw)))
+            local c  = line:sub(srcCol, srcCol)
             local ci = BLIT:find(c, 1, true)
             if ci then
-                ci = ci - 1
-                local bc = BLIT:sub(ci+1, ci+1)
-                mon.setCursorPos(col, row); mon.blit(" ", bc, bc)
+                local bc = BLIT:sub(ci, ci)
+                mon.setCursorPos(col, row)
+                mon.blit(" ", bc, bc)
             end
         end
-        row = row + 1
     end
 end
 
