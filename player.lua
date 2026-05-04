@@ -2,7 +2,7 @@
 local GITHUB_RAW = "https://raw.githubusercontent.com/ob-105/CC-tweaked-Audio-video-playback./main"
 local SELF_URL   = GITHUB_RAW .. "/player.lua"
 local SELF_PATH  = "player.lua"
-local VERSION    = "14"
+local VERSION    = "15"
 
 local function selfUpdate()
     print("[player] Checking for updates...")
@@ -126,7 +126,9 @@ end
 local function renderNFP(mon, data)
     if not mon then return end
     local lines = {}
-    for line in (data.."\n"):gmatch("([^\n]*)\n") do lines[#lines+1] = line end
+    for line in (data.."\n"):gmatch("([^\n]*)\n") do
+        lines[#lines+1] = line:gsub("\r", "")
+    end
     renderLines(mon, lines)
 end
 
@@ -134,8 +136,9 @@ local function renderNFPC(mon, data)
     if not mon then return end
     local lines = {}
     for rowstr in (data.."\n"):gmatch("([^\n]*)\n") do
+        local rs   = rowstr:gsub("\r", "")
         local line = ""
-        for run in (rowstr.."|" ):gmatch("([^|]*)|" ) do
+        for run in (rs.."|" ):gmatch("([^|]*)|" ) do
             local c, n = run:match("^(.):(%d+)$")
             if c and n then line = line .. c:rep(tonumber(n)) end
         end
