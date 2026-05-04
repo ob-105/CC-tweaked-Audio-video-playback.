@@ -35,6 +35,23 @@ except ImportError:
     print("Missing dependencies. Run:  pip install Pillow numpy")
     sys.exit(1)
 
+# Ensure winget-installed binaries (like ffmpeg) are on PATH even in stale shells
+import winreg
+def _refresh_path():
+    paths = set(os.environ.get("PATH", "").split(os.pathsep))
+    for hive, scope in [(winreg.HKEY_LOCAL_MACHINE, "SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment"),
+                        (winreg.HKEY_CURRENT_USER, "Environment")]:
+        try:
+            key = winreg.OpenKey(hive, scope)
+            val, _ = winreg.QueryValueEx(key, "Path")
+            winreg.CloseKey(key)
+            for p in val.split(os.pathsep):
+                paths.add(os.path.expandvars(p))
+        except Exception:
+            pass
+    os.environ["PATH"] = os.pathsep.join(p for p in paths if p)
+_refresh_path()
+
 
 # ---------------------------------------------------------------------------
 # CC:T 16-colour palette (matches the default palette in CC:Tweaked)
