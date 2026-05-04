@@ -2,7 +2,7 @@
 local GITHUB_RAW = "https://raw.githubusercontent.com/ob-105/CC-tweaked-Audio-video-playback./main"
 local SELF_URL   = GITHUB_RAW .. "/player.lua"
 local SELF_PATH  = "player.lua"
-local VERSION    = "15"
+local VERSION    = "16"
 
 local function selfUpdate()
     print("[player] Checking for updates...")
@@ -99,7 +99,6 @@ local function findSpeakers()
     return found
 end
 
-local BLIT = "0123456789abcdef"
 local function renderLines(mon, lines)
     if not mon then return end
     local nh = #lines
@@ -107,19 +106,20 @@ local function renderLines(mon, lines)
     local nw = #lines[1]
     if nw == 0 then return end
     local mw, mh = mon.getSize()
+    -- Build each output row as a full-width blit string, then send in one call.
+    -- This cuts API calls from (mw * mh) down to mh, which is ~mw times faster.
+    local spaces = (" "):rep(mw)
     for row = 1, mh do
         local srcRow = math.max(1, math.min(nh, math.ceil(row * nh / mh)))
         local line   = lines[srcRow]
+        local colour = {}
         for col = 1, mw do
             local srcCol = math.max(1, math.min(nw, math.ceil(col * nw / mw)))
-            local c  = line:sub(srcCol, srcCol)
-            local ci = BLIT:find(c, 1, true)
-            if ci then
-                local bc = BLIT:sub(ci, ci)
-                mon.setCursorPos(col, row)
-                mon.blit(" ", bc, bc)
-            end
+            colour[col]  = line:sub(srcCol, srcCol)
         end
+        local colStr = table.concat(colour)
+        mon.setCursorPos(1, row)
+        mon.blit(spaces, colStr, colStr)
     end
 end
 
