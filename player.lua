@@ -2,7 +2,7 @@
 local GITHUB_RAW = "https://raw.githubusercontent.com/ob-105/CC-tweaked-Audio-video-playback./main"
 local SELF_URL   = GITHUB_RAW .. "/player.lua"
 local SELF_PATH  = "player.lua"
-local VERSION    = "4"
+local VERSION    = "5"
 
 local function selfUpdate()
     print("[player] Checking for updates...")
@@ -110,6 +110,9 @@ local function playMedia(mon, speaker, name, manifest)
     local audio = manifest.has_audio == "true"
     local video = manifest.has_video == "true" and mon ~= nil
     print(("[player] Playing '%s'"):format(name))
+    print(("[player] frames=%d  audio=%s  video=%s  speaker=%s  monitor=%s"):format(
+        count, tostring(audio), tostring(video),
+        tostring(speaker ~= nil), tostring(mon ~= nil)))
     local pre = math.min(10, count)
     if video and count > 0 then
         print(("[player] Pre-fetching %d frames..."):format(pre))
