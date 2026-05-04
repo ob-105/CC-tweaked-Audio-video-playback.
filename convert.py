@@ -19,6 +19,7 @@ Output goes into  output/<media_name>/  and is auto-pushed to GitHub.
 """
 
 import argparse
+import multiprocessing
 import os
 import shutil
 import struct
@@ -78,30 +79,36 @@ CC_PALETTE = [
 # NFP colour characters (index → char)
 NFP_CHARS = "0123456789abcdef"
 
-
-def nearest_cc_colour(r, g, b):
-    """Return the index of the nearest CC:T palette colour."""
-    best = 0
-    best_dist = float("inf")
-    for i, (pr, pg, pb) in enumerate(CC_PALETTE):
-        dist = (r - pr) ** 2 + (g - pg) ** 2 + (b - pb) ** 2
-        if dist < best_dist:
-            best_dist = dist
-            best = i
-    return best
+# Precomputed numpy arrays for vectorised colour matching
+_CC_PALETTE_NP = np.array(CC_PALETTE, dtype=np.int32)   # (16, 3)
+_NFP_CHARS_ARR = np.array(list(NFP_CHARS))               # (16,)
 
 
 def image_to_nfp(img, width, height):
-    """Convert a PIL Image to an NFP string."""
-    img = img.resize((width, height), Image.LANCZOS).convert("RGB")
-    pixels = np.array(img)
-    lines = []
-    for row in pixels:
-        line = ""
-        for r, g, b in row:
-            line += NFP_CHARS[nearest_cc_colour(int(r), int(g), int(b))]
-        lines.append(line)
-    return "\n".join(lines)
+    """Convert a PIL Image to NFP using vectorised numpy (fast path)."""
+    img    = img.resize((width, height), Image.LANCZOS).convert("RGB")
+    pixels = np.array(img, dtype=np.int32)                      # (H, W, 3)
+    diff   = pixels[:, :, np.newaxis, :] - _CC_PALETTE_NP      # (H, W, 16, 3)
+    idx    = (diff ** 2).sum(axis=-1).argmin(axis=-1)          # (H, W)
+    chars  = _NFP_CHARS_ARR[idx]                               # (H, W)
+    return "\n".join("".join(row) for row in chars)
+
+
+def _frame_worker(args):
+    """Top-level worker used by ProcessPoolExecutor for parallel NFP conversion."""
+    png_path, nfp_path, width, height = args
+    from PIL import Image as _Img
+    import numpy as _np
+    _pal  = _np.array(CC_PALETTE, dtype=_np.int32)
+    _ch   = _np.array(list(NFP_CHARS))
+    img   = _Img.open(png_path).resize((width, height), _Img.LANCZOS).convert("RGB")
+    px    = _np.array(img, dtype=_np.int32)
+    diff  = px[:, :, _np.newaxis, :] - _pal
+    idx   = (diff ** 2).sum(axis=-1).argmin(axis=-1)
+    nfp   = "\n".join("".join(row) for row in _ch[idx])
+    with open(nfp_path, "w") as f:
+        f.write(nfp)
+    return nfp_path
 
 
 # ---------------------------------------------------------------------------
@@ -213,17 +220,26 @@ def extract_frames(input_path, frames_dir, fps, width, height):
 
         png_files = sorted(f for f in os.listdir(tmp_dir) if f.endswith(".png"))
         total = len(png_files)
-        print(f"  Converting {total} frames to NFP...")
+        print(f"  Converting {total} frames to NFP (parallel)...")
 
-        for idx, png_file in enumerate(png_files):
-            img = Image.open(os.path.join(tmp_dir, png_file))
-            nfp = image_to_nfp(img, width, height)
-            nfp_path = os.path.join(frames_dir, f"{idx + 1:06d}.nfp")
-            with open(nfp_path, "w") as f:
-                f.write(nfp)
+        worker_args = [
+            (
+                os.path.join(tmp_dir, pf),
+                os.path.join(frames_dir, f"{i + 1:06d}.nfp"),
+                width,
+                height,
+            )
+            for i, pf in enumerate(png_files)
+        ]
 
-            if (idx + 1) % 10 == 0 or (idx + 1) == total:
-                print(f"    {idx + 1}/{total} frames done", end="\r")
+        from concurrent.futures import ProcessPoolExecutor
+        cpu = max(1, os.cpu_count() or 1)
+        done = 0
+        with ProcessPoolExecutor(max_workers=cpu) as pool:
+            for _ in pool.map(_frame_worker, worker_args, chunksize=4):
+                done += 1
+                if done % 10 == 0 or done == total:
+                    print(f"    {done}/{total} frames done", end="\r")
 
         print()
         return total
@@ -558,4 +574,5 @@ def main():
 
 
 if __name__ == "__main__":
+    multiprocessing.freeze_support()
     main()
