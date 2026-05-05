@@ -581,15 +581,19 @@ def launch_gui():
                                   variable=var_compress)
     cb_compress.grid(row=3, column=0, columnspan=5, sticky="w", pady=(6, 0))
 
+    var_dither = tk.BooleanVar(value=True)
+    ttk.Checkbutton(sf, text="Dithering (Floyd-Steinberg; dramatically improves image quality)",
+                    variable=var_dither).grid(row=4, column=0, columnspan=5, sticky="w", pady=(2, 0))
+
     var_halfblock = tk.BooleanVar(value=False)
     ttk.Checkbutton(sf, text="Half-block rendering \u2584  (2\u00d7 vertical resolution; combinable with RLE)",
-                    variable=var_halfblock).grid(row=4, column=0, columnspan=5, sticky="w", pady=(2, 0))
+                    variable=var_halfblock).grid(row=5, column=0, columnspan=5, sticky="w", pady=(2, 0))
 
     var_delta = tk.BooleanVar(value=False)
     cb_delta = ttk.Checkbutton(sf,
-        text="Delta encoding (only store changed rows; requires ▄+RLE; best compression)",
+        text="Delta encoding (only store changed rows; requires \u2584+RLE; best compression)",
         variable=var_delta, state="disabled")
-    cb_delta.grid(row=5, column=0, columnspan=5, sticky="w", pady=(2, 0))
+    cb_delta.grid(row=6, column=0, columnspan=5, sticky="w", pady=(2, 0))
 
     def on_delta_prereq_toggle(*_):
         if var_halfblock.get() and var_compress.get():
@@ -603,7 +607,7 @@ def launch_gui():
 
     var_push = tk.BooleanVar(value=True)
     ttk.Checkbutton(sf, text="Auto-push to GitHub after converting", variable=var_push).grid(
-        row=6, column=0, columnspan=5, sticky="w", pady=(2, 0))
+        row=7, column=0, columnspan=5, sticky="w", pady=(2, 0))
 
     # ── File list ─────────────────────────────────────────────────────────
     ff = ttk.LabelFrame(root, text="Files in  input/", padding=10)
