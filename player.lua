@@ -2,7 +2,7 @@
 local GITHUB_RAW = "https://raw.githubusercontent.com/ob-105/CC-tweaked-Audio-video-playback./main"
 local SELF_URL   = GITHUB_RAW .. "/player.lua"
 local SELF_PATH  = "player.lua"
-local VERSION    = "25"
+local VERSION    = "26"
 
 local function selfUpdate()
     print("[player] Checking for updates...")
@@ -523,30 +523,45 @@ local function mediaActionMenu(name)
     print("=================================")
     print(("  %s"):format(name))
     print("=================================")
-    print("  1. Play now  (stream on demand)")
-    print("  2. Pre-download to local disk")
-    print("  3. Upload to storage network")
+    print("  1. Stream from GitHub  (rolling disk buffer)")
+    print("  2. Pre-download to disk, then play")
+    print("  3. Upload to storage network, then play")
+    print("  4. Play from storage network  (already uploaded)")
     print("---------------------------------")
     print("  0. Back"); print()
     io.write("Choice: ")
     local n = tonumber(io.read())
     if n == 1 then return "play"
     elseif n == 2 then return "predownload"
-    elseif n == 3 then return "network"
+    elseif n == 3 then return "upload_play"
+    elseif n == 4 then return "network_play"
     else return nil end
 end
 
 local function calcBuffer(manifest)
-    -- Each NFP frame is (width + 1) * height bytes (chars + newlines)
-    local fw = manifest.width  or 51
-    local fh = manifest.height or 19
-    local frame_bytes = (fw + 1) * fh
+    local fw   = manifest.width  or 51
+    local fh   = manifest.height or 19
+    local fext = manifest.frame_ext or "nfp"
+    -- Estimate worst-case bytes per frame based on format:
+    --   nfp:    fw chars/row  → (fw+1)*fh
+    --   nfpc:   RLE can be larger than raw if content varies → same as nfp
+    --   nfph:   two colour strings + separator per row → (fw*2+2)*fh
+    --   nfphc:  RLE on both halves; dithered = ~4 bytes/char → (fw*8+2)*fh
+    --   nfphcd: similar to nfphc in worst case
+    local frame_bytes
+    if fext == "nfphc" or fext == "nfphcd" then
+        frame_bytes = (fw * 8 + 2) * fh   -- pessimistic RLE on dithered content
+    elseif fext == "nfph" then
+        frame_bytes = (fw * 2 + 2) * fh
+    else
+        frame_bytes = (fw + 1) * fh
+    end
     -- Leave 200 KB headroom for the OS, player.lua and index files
     local free = fs.getFreeSpace("/") - 200 * 1024
     if free <= 0 then return 1 end
     -- Use at most half the remaining free space for the frame buffer
     local buf = math.floor((free / 2) / frame_bytes)
-    return math.max(1, math.min(buf, 60))  -- clamp: at least 1, at most 60
+    return math.max(1, math.min(buf, 30))  -- clamp: at least 1, at most 30
 end
 
 local function playMedia(mon, speakers, name, manifest, store)
@@ -755,10 +770,18 @@ local function main()
                 if subaction == "predownload" then
                     preDownload(pick, manifest)
                     playMedia(mon, speakers, pick, manifest, nil)
-                elseif subaction == "network" then
+                elseif subaction == "upload_play" then
                     local store = initStore()
                     if store then
                         uploadToNetwork(pick, manifest, store)
+                        playMedia(mon, speakers, pick, manifest, store)
+                    else
+                        print("[error] Could not connect to storage network.")
+                        print("Press Enter..."); io.read()
+                    end
+                elseif subaction == "network_play" then
+                    local store = initStore()
+                    if store then
                         playMedia(mon, speakers, pick, manifest, store)
                     else
                         print("[error] Could not connect to storage network.")
