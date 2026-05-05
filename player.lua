@@ -2,7 +2,7 @@
 local GITHUB_RAW = "https://raw.githubusercontent.com/ob-105/CC-tweaked-Audio-video-playback./main"
 local SELF_URL   = GITHUB_RAW .. "/player.lua"
 local SELF_PATH  = "player.lua"
-local VERSION    = "21"
+local VERSION    = "22"
 
 local function selfUpdate()
     print("[player] Checking for updates...")
@@ -244,25 +244,40 @@ end
 -- ---------------------------------------------------------------------------
 local STORAGE_API_URL = "https://raw.githubusercontent.com/ob-105/CC-Tweaked-General-Purpose-Storage-Network/main/storage_api.lua"
 
--- Returns the peripheral names of modems that have a speaker on their local
--- wired network, so we can keep them closed for rednet (storage network use only).
-local function speakerModemNames()
-    local names = {}
+-- Probe each modem individually to find the one connected to the storage
+-- controller, then pre-open it so storage_api's broadcast reaches the right
+-- network. Works regardless of whether peripherals share a network or not.
+local CTRL_PROTOCOL = "cct-store-ctrl"
+local function findStorageModem()
+    local allModems = {}
     for _, side in ipairs(peripheral.getNames()) do
-        if peripheral.getType(side) == "modem" then
-            local p = peripheral.wrap(side)
-            -- Only wired modems host other peripherals
-            if p and p.isWireless and not p.isWireless() and p.getNamesRemote then
-                for _, rname in ipairs(p.getNamesRemote()) do
-                    if peripheral.getType(rname) == "speaker" then
-                        names[#names+1] = side
-                        break
-                    end
-                end
+        if peripheral.getType(side) == "modem" then allModems[#allModems+1] = side end
+    end
+    if #allModems <= 1 then return allModems[1] end
+    -- Close all modems so we can test each in isolation
+    for _, s in ipairs(allModems) do pcall(rednet.close, s) end
+    local found = nil
+    for _, side in ipairs(allModems) do
+        pcall(rednet.open, side)
+        rednet.broadcast({cmd = "ping"}, CTRL_PROTOCOL)
+        local deadline = os.clock() + 2
+        while os.clock() < deadline do
+            local sender, msg = rednet.receive(CTRL_PROTOCOL, deadline - os.clock())
+            if sender and type(msg) == "table" and msg.ok then
+                found = side; break
             end
         end
+        pcall(rednet.close, side)
+        if found then break end
     end
-    return names
+    -- Pre-open the found modem so storage_api broadcasts through it.
+    -- If nothing responded, open all modems and let storage_api try.
+    if found then
+        pcall(rednet.open, found)
+    else
+        for _, s in ipairs(allModems) do pcall(rednet.open, s) end
+    end
+    return found
 end
 
 local function initStore()
@@ -272,15 +287,21 @@ local function initStore()
         print(ok and "OK" or "FAILED")
         if not ok then return nil end
     end
+    -- Only probe when there are multiple modems (single-modem setups need no help)
+    local modemCount = 0
+    for _, side in ipairs(peripheral.getNames()) do
+        if peripheral.getType(side) == "modem" then modemCount = modemCount + 1 end
+    end
+    if modemCount > 1 then
+        io.write("[net] Probing modems for storage controller... ")
+        local found = findStorageModem()
+        if found then print("found on " .. found)
+        else print("not found — trying all modems") end
+    end
     local ok, store = pcall(require, "storage_api")
     if not ok then
         print("[net] storage_api load failed: " .. tostring(store))
         return nil
-    end
-    -- storage_api opens all modems for rednet; close any that are dedicated
-    -- to speakers so controller discovery uses only the network modem.
-    for _, mname in ipairs(speakerModemNames()) do
-        pcall(rednet.close, mname)
     end
     return store
 end
