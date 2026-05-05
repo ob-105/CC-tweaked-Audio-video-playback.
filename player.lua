@@ -2,7 +2,7 @@
 local GITHUB_RAW = "https://raw.githubusercontent.com/ob-105/CC-tweaked-Audio-video-playback./main"
 local SELF_URL   = GITHUB_RAW .. "/player.lua"
 local SELF_PATH  = "player.lua"
-local VERSION    = "18"
+local VERSION    = "19"
 
 local function selfUpdate()
     print("[player] Checking for updates...")
@@ -172,47 +172,137 @@ local function renderNFPH(mon, data)
 end
 
 local function playAudio(speakers, name, stats)
-    local url = GITHUB_RAW .. "/output/" .. name .. "/audio.dfpwm"
-    print(("[player] Streaming audio on %d speaker(s)..."):format(#speakers))
-    local res = http.get(url, nil, true)
-    if not res then
-        print("[player] Audio fetch FAILED.")
-        if stats then stats.audioFailed = true end
-        return
-    end
     local dfpwm   = require("cc.audio.dfpwm")
     local decoder = dfpwm.make_decoder()
     local stalls  = 0
-    while true do
-        local t0chunk = os.clock()
-        local chunk = res.read(16384)
-        if not chunk then break end
-        local fetchTime = os.clock() - t0chunk
-        if fetchTime > 0.5 then
-            stalls = stalls + 1
-            if stats then stats.audioStalls = (stats.audioStalls or 0) + 1 end
-            print(("\n[warn] Audio HTTP slow: %.2fs"):format(fetchTime))
-        end
-        local pcm  = decoder(chunk)
-        local busy = true
-        local underrun = false
-        while busy do
-            busy = false
-            for _, spk in ipairs(speakers) do
-                if not spk.playAudio(pcm) then busy = true end
+
+    local function processChunks(readFn, closeFn)
+        while true do
+            local t0chunk = os.clock()
+            local chunk = readFn()
+            if not chunk then break end
+            local fetchTime = os.clock() - t0chunk
+            if fetchTime > 0.5 then
+                stalls = stalls + 1
+                if stats then stats.audioStalls = (stats.audioStalls or 0) + 1 end
+                print(("\n[warn] Audio fetch slow: %.2fs"):format(fetchTime))
             end
-            if busy then
-                underrun = true
-                os.pullEvent("speaker_audio_empty")
+            local pcm  = decoder(chunk)
+            local busy = true
+            local underrun = false
+            while busy do
+                busy = false
+                for _, spk in ipairs(speakers) do
+                    if not spk.playAudio(pcm) then busy = true end
+                end
+                if busy then
+                    underrun = true
+                    os.pullEvent("speaker_audio_empty")
+                end
+            end
+            if underrun then
+                stalls = stalls + 1
+                if stats then stats.audioStalls = (stats.audioStalls or 0) + 1 end
             end
         end
-        if underrun then
-            stalls = stalls + 1
-            if stats then stats.audioStalls = (stats.audioStalls or 0) + 1 end
+        closeFn()
+    end
+
+    local localPath = "media/" .. name .. "/audio.dfpwm"
+    if fs.exists(localPath) then
+        print("[player] Playing audio from local cache...")
+        local fh = fs.open(localPath, "rb")
+        if not fh then
+            if stats then stats.audioFailed = true end; return
+        end
+        processChunks(function() return fh.read(16384) end, function() fh.close() end)
+    else
+        local url = GITHUB_RAW .. "/output/" .. name .. "/audio.dfpwm"
+        print(("[player] Streaming audio on %d speaker(s)..."):format(#speakers))
+        local res = http.get(url, nil, true)
+        if not res then
+            print("[player] Audio fetch FAILED.")
+            if stats then stats.audioFailed = true end; return
+        end
+        processChunks(function() return res.read(16384) end, function() res.close() end)
+    end
+
+    if stats then stats.audioStalls = stalls end
+end
+
+local function preDownload(name, manifest)
+    local count = manifest.frame_count or 0
+    local fext  = manifest.frame_ext or "nfp"
+    local audio = manifest.has_audio == "true"
+    local video = manifest.has_video == "true"
+
+    term.clear(); term.setCursorPos(1,1)
+    print(("=== Pre-downloading '%s' ==="):format(name))
+
+    -- Disk space check
+    if count > 0 then
+        local fw    = manifest.width  or 51
+        local fh    = manifest.height or 19
+        local estKB = math.ceil(((fw + 1) * fh * count) / 1024)
+        local freeKB = math.ceil(fs.getFreeSpace("/") / 1024)
+        print(("  %d frames  ~%d KB needed  %d KB free"):format(count, estKB, freeKB))
+        if freeKB < estKB + 300 then
+            print("[warn] Disk may be too small to fit all frames.")
+            io.write("Continue anyway? (y/n): ")
+            if io.read():lower() ~= "y" then return end
         end
     end
-    res.close()
-    if stats then stats.audioStalls = stalls end
+
+    -- Audio
+    if audio then
+        local ap = "media/" .. name .. "/audio.dfpwm"
+        if fs.exists(ap) then
+            print("  Audio: already cached.")
+        else
+            io.write("  Downloading audio... ")
+            local ok = download(GITHUB_RAW .. "/output/" .. name .. "/audio.dfpwm", ap)
+            print(ok and "OK" or "FAILED")
+        end
+    end
+
+    -- Frames
+    if video and count > 0 then
+        local failed = 0
+        for i = 1, count do
+            local p   = ("media/%s/frames/%06d.%s"):format(name, i, fext)
+            local url = ("%s/output/%s/frames/%06d.%s"):format(GITHUB_RAW, name, i, fext)
+            if not fs.exists(p) then
+                if not download(url, p) then failed = failed + 1 end
+            end
+            term.write(("\r  Frames %d/%d (%d%%)  fail=%d   "):format(
+                i, count, math.floor(i * 100 / count), failed))
+        end
+        print()
+        if failed > 0 then
+            print(("[warn] %d frame(s) could not be downloaded."):format(failed))
+        else
+            print("[preload] All frames cached successfully.")
+        end
+    end
+
+    print("\n[preload] Done — press Enter to start playback.")
+    io.read()
+end
+
+local function mediaActionMenu(name)
+    term.clear(); term.setCursorPos(1,1)
+    print("=================================")
+    print(("  %s"):format(name))
+    print("=================================")
+    print("  1. Play now  (stream on demand)")
+    print("  2. Pre-download then play")
+    print("---------------------------------")
+    print("  0. Back"); print()
+    io.write("Choice: ")
+    local n = tonumber(io.read())
+    if n == 1 then return "play"
+    elseif n == 2 then return "predownload"
+    else return nil end
 end
 
 local function calcBuffer(manifest)
@@ -387,7 +477,11 @@ local function main()
         elseif action == "play" and pick then
             local ok, manifest = pcall(loadManifest, pick)
             if not ok then print("[error] "..tostring(manifest)); print("Press Enter..."); io.read()
-            else playMedia(mon, speakers, pick, manifest) end
+            else
+                local subaction = mediaActionMenu(pick)
+                if subaction == "predownload" then preDownload(pick, manifest) end
+                if subaction then playMedia(mon, speakers, pick, manifest) end
+            end
         end
     end
 end
