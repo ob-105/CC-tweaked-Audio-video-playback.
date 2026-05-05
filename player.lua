@@ -2,7 +2,7 @@
 local GITHUB_RAW = "https://raw.githubusercontent.com/ob-105/CC-tweaked-Audio-video-playback./main"
 local SELF_URL   = GITHUB_RAW .. "/player.lua"
 local SELF_PATH  = "player.lua"
-local VERSION    = "26"
+local VERSION    = "27"
 
 local function selfUpdate()
     print("[player] Checking for updates...")
@@ -606,26 +606,51 @@ local function playMedia(mon, speakers, name, manifest, store)
     end
 
     local t0 = os.clock()
+
+    -- Prefetch ring-buffer for network play.
+    -- prefetchBuf[i] = data string when ready, false if fetch failed, nil if not yet fetched.
+    -- The prefetcher coroutine runs in parallel with the renderer and stays NET_AHEAD frames
+    -- ahead. store.get() and os.sleep() both yield in CC:T, so the two coroutines interleave
+    -- naturally: prefetcher fetches while renderer is sleeping for frame timing.
+    local prefetchBuf = {}
+    local renderIdx   = 0      -- frame the renderer is currently waiting for
+    local NET_AHEAD   = 4      -- how many frames to fetch ahead
+
+    local function prefetchLoop()
+        if not store then return end
+        for i = 1, count do
+            -- Throttle: don't race more than NET_AHEAD frames ahead of the renderer
+            while i > renderIdx + NET_AHEAD do
+                os.sleep(0)  -- yield to renderer / audio coroutines
+            end
+            if prefetchBuf[i] == nil then
+                local key  = ("media/%s/frames/%06d"):format(name, i)
+                local data = store.get(key)
+                prefetchBuf[i] = data or false
+            end
+        end
+    end
+
     local function videoLoop()
         for frame = 1, count do
+            renderIdx = frame
             local due     = (frame - 1) * framePeriod
             local elapsed = os.clock() - t0
             local frameData = nil
 
             if store then
-                -- Fetch frame from storage network
-                local dlT0 = os.clock()
-                local key  = ("media/%s/frames/%06d"):format(name, frame)
-                local data, err = store.get(key)
-                local dlMs = math.floor((os.clock() - dlT0) * 1000)
-                if data then
-                    frameData = data
-                    if dlMs > framePeriod * 1000 then
-                        stats.dlSlow = stats.dlSlow + 1
-                    end
+                -- Wait for the prefetcher to deliver this frame.
+                -- Give it up to 2× the frame period before declaring it late.
+                local giveUp = os.clock() + framePeriod * 2
+                while prefetchBuf[frame] == nil and os.clock() < giveUp do
+                    os.sleep(0)  -- yield so prefetcher can run
+                end
+                local fd = prefetchBuf[frame]
+                prefetchBuf[frame] = nil  -- release memory immediately
+                if fd then
+                    frameData = fd
                 else
                     stats.dlFailed = stats.dlFailed + 1
-                    print(("\n[warn] Frame %d network FAILED: %s"):format(frame, tostring(err)))
                 end
             else
                 -- Download to local disk (original streaming path)
@@ -650,6 +675,7 @@ local function playMedia(mon, speakers, name, manifest, store)
             end
 
             -- Live status line (overwrites itself)
+            elapsed = os.clock() - t0
             local timeLeft = math.max(0, totalSecs - elapsed)
             term.write(("\r  Frame %d/%d (%d%%)  %.0fs left  skip=%d  slow=%d  fail=%d   "):format(
                 frame, count,
@@ -687,9 +713,10 @@ local function playMedia(mon, speakers, name, manifest, store)
     local function audioLoop()
         if audio and #speakers > 0 then playAudio(speakers, name, stats, audioData) end
     end
-    if audio and video and count > 0 then parallel.waitForAll(audioLoop, videoLoop)
+    -- Always include prefetchLoop in parallel (it exits immediately if store==nil)
+    if audio and video and count > 0 then parallel.waitForAll(audioLoop, videoLoop, prefetchLoop)
     elseif audio then audioLoop()
-    elseif count > 0 then videoLoop() end
+    elseif count > 0 then parallel.waitForAll(videoLoop, prefetchLoop) end
 
     -- Playback summary
     print("[player] Playback complete.")
