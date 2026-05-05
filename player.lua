@@ -2,7 +2,7 @@
 local GITHUB_RAW = "https://raw.githubusercontent.com/ob-105/CC-tweaked-Audio-video-playback./main"
 local SELF_URL   = GITHUB_RAW .. "/player.lua"
 local SELF_PATH  = "player.lua"
-local VERSION    = "20"
+local VERSION    = "21"
 
 local function selfUpdate()
     print("[player] Checking for updates...")
@@ -244,6 +244,27 @@ end
 -- ---------------------------------------------------------------------------
 local STORAGE_API_URL = "https://raw.githubusercontent.com/ob-105/CC-Tweaked-General-Purpose-Storage-Network/main/storage_api.lua"
 
+-- Returns the peripheral names of modems that have a speaker on their local
+-- wired network, so we can keep them closed for rednet (storage network use only).
+local function speakerModemNames()
+    local names = {}
+    for _, side in ipairs(peripheral.getNames()) do
+        if peripheral.getType(side) == "modem" then
+            local p = peripheral.wrap(side)
+            -- Only wired modems host other peripherals
+            if p and p.isWireless and not p.isWireless() and p.getNamesRemote then
+                for _, rname in ipairs(p.getNamesRemote()) do
+                    if peripheral.getType(rname) == "speaker" then
+                        names[#names+1] = side
+                        break
+                    end
+                end
+            end
+        end
+    end
+    return names
+end
+
 local function initStore()
     if not fs.exists("storage_api.lua") then
         io.write("[net] Downloading storage_api.lua... ")
@@ -255,6 +276,11 @@ local function initStore()
     if not ok then
         print("[net] storage_api load failed: " .. tostring(store))
         return nil
+    end
+    -- storage_api opens all modems for rednet; close any that are dedicated
+    -- to speakers so controller discovery uses only the network modem.
+    for _, mname in ipairs(speakerModemNames()) do
+        pcall(rednet.close, mname)
     end
     return store
 end
