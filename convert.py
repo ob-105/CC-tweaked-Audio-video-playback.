@@ -135,8 +135,23 @@ def _frame_worker(args):
             return (d ** 2).sum(axis=-1).argmin(axis=-1)
         top_chars = _ch[_match(top_px)]  # (char_rows, width)
         bot_chars = _ch[_match(bot_px)]
-        rows = ["".join(top_chars[i]) + "|" + "".join(bot_chars[i])
-                for i in range(top_chars.shape[0])]
+        if compress:
+            def _rle(chars):
+                runs = []
+                cur = chars[0]; count = 1
+                for c in chars[1:]:
+                    if c == cur:
+                        count += 1
+                    else:
+                        runs.append(f"{cur}:{count}")
+                        cur = c; count = 1
+                runs.append(f"{cur}:{count}")
+                return "|".join(runs)
+            rows = [_rle(top_chars[i]) + ";" + _rle(bot_chars[i])
+                    for i in range(top_chars.shape[0])]
+        else:
+            rows = ["".join(top_chars[i]) + "|" + "".join(bot_chars[i])
+                    for i in range(top_chars.shape[0])]
         data = "\n".join(rows)
     else:
         diff      = px[:, :, _np.newaxis, :] - _pal
@@ -252,17 +267,25 @@ def convert_audio_to_dfpwm(input_path, output_path):
 
 
 def extract_frames(input_path, frames_dir, fps, width, height, compress=False, halfblock=False):
-    """Extract video frames from MP4 and convert to NFP, NFPC, or NFPH."""
-    if halfblock:
+    """Extract video frames from MP4 and convert to NFP, NFPC, NFPH, or NFPHC."""
+    if halfblock and compress:
+        ext          = "nfphc"
+        pixel_height = height * 2
+        mode_label   = "NFPHC half-block+RLE"
+    elif halfblock:
         ext          = "nfph"
-        pixel_height = height * 2   # double vertical pixel count for half-block rendering
+        pixel_height = height * 2
         mode_label   = "NFPH half-block"
-    else:
-        ext          = "nfpc" if compress else "nfp"
+    elif compress:
+        ext          = "nfpc"
         pixel_height = height
-        mode_label   = "NFPC RLE" if compress else "NFP"
+        mode_label   = "NFPC RLE"
+    else:
+        ext          = "nfp"
+        pixel_height = height
+        mode_label   = "NFP"
 
-    all_exts = ["nfp", "nfpc", "nfph"]
+    all_exts = ["nfp", "nfpc", "nfph", "nfphc"]
     old_exts = [e for e in all_exts if e != ext]
 
     print(f"  Extracting frames at {fps} FPS ({width}x{pixel_height}) [{ext}]...")
@@ -414,7 +437,7 @@ def convert_file(input_path, fps, monitors_x, monitors_y, compress=False, halfbl
         "height": height,
         "monitors_x": monitors_x,
         "monitors_y": monitors_y,
-        "frame_ext": "nfph" if halfblock else ("nfpc" if compress else "nfp"),
+        "frame_ext": ("nfphc" if compress else "nfph") if halfblock else ("nfpc" if compress else "nfp"),
     }
 
     audio_path = os.path.join(output_dir, "audio.dfpwm")
@@ -500,17 +523,8 @@ def launch_gui():
     cb_compress.grid(row=3, column=0, columnspan=5, sticky="w", pady=(6, 0))
 
     var_halfblock = tk.BooleanVar(value=False)
-    ttk.Checkbutton(sf, text="Half-block rendering ▄  (2× vertical resolution; disables RLE)",
+    ttk.Checkbutton(sf, text="Half-block rendering \u2584  (2\u00d7 vertical resolution; combinable with RLE)",
                     variable=var_halfblock).grid(row=4, column=0, columnspan=5, sticky="w", pady=(2, 0))
-
-    def on_halfblock_toggle(*_):
-        if var_halfblock.get():
-            var_compress.set(False)
-            cb_compress.configure(state="disabled")
-        else:
-            cb_compress.configure(state="normal")
-
-    var_halfblock.trace_add("write", on_halfblock_toggle)
 
     var_push = tk.BooleanVar(value=True)
     ttk.Checkbutton(sf, text="Auto-push to GitHub after converting", variable=var_push).grid(

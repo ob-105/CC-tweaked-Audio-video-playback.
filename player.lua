@@ -2,7 +2,7 @@
 local GITHUB_RAW = "https://raw.githubusercontent.com/ob-105/CC-tweaked-Audio-video-playback./main"
 local SELF_URL   = GITHUB_RAW .. "/player.lua"
 local SELF_PATH  = "player.lua"
-local VERSION    = "22"
+local VERSION    = "23"
 
 local function selfUpdate()
     print("[player] Checking for updates...")
@@ -162,6 +162,35 @@ local function renderNFPH(mon, data)
         if sep then
             local top = ln:sub(1, sep - 1)  -- background = top pixel colour
             local bot = ln:sub(sep + 1)     -- foreground = bottom pixel colour
+            local w   = #top
+            if w > 0 then
+                mon.setCursorPos(1, row)
+                mon.blit(HALF_BLOCK:rep(w), bot, top)
+            end
+        end
+    end
+end
+
+-- NFPHC: half-block + RLE. Each line = "topRLE;botRLE" where each side
+-- uses the same char:count|char:count encoding as NFPC.
+local function renderNFPHC(mon, data)
+    if not mon then return end
+    local function decodeRLE(rle)
+        local s = ""
+        for run in (rle.."|" ):gmatch("([^|]*)|" ) do
+            local c, n = run:match("^(.):(%d+)$")
+            if c and n then s = s .. c:rep(tonumber(n)) end
+        end
+        return s
+    end
+    local row = 0
+    for line in (data.."\n"):gmatch("([^\n]*)\n") do
+        row = row + 1
+        local ln  = line:gsub("\r", "")
+        local sep = ln:find(";", 1, true)
+        if sep then
+            local top = decodeRLE(ln:sub(1, sep - 1))
+            local bot = decodeRLE(ln:sub(sep + 1))
             local w   = #top
             if w > 0 then
                 mon.setCursorPos(1, row)
@@ -560,7 +589,8 @@ local function playMedia(mon, speakers, name, manifest, store)
                 local wait = due - elapsed
                 if wait > 0 then os.sleep(wait) end
                 if frameData and video then
-                    if fext == "nfph" then renderNFPH(mon, frameData)
+                    if fext == "nfphc" then renderNFPHC(mon, frameData)
+                    elseif fext == "nfph" then renderNFPH(mon, frameData)
                     elseif fext == "nfpc" then renderNFPC(mon, frameData)
                     else renderNFP(mon, frameData) end
                 end
