@@ -9,6 +9,6 @@ return {
   height = 114,
   monitors_x = 8,
   monitors_y = 6,
-  frame_ext = "nfpc",
+  frame_ext = "nfph",
   duration = 184.02,
 }
