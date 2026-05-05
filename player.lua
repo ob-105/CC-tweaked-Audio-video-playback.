@@ -2,7 +2,7 @@
 local GITHUB_RAW = "https://raw.githubusercontent.com/ob-105/CC-tweaked-Audio-video-playback./main"
 local SELF_URL   = GITHUB_RAW .. "/player.lua"
 local SELF_PATH  = "player.lua"
-local VERSION    = "17"
+local VERSION    = "18"
 
 local function selfUpdate()
     print("[player] Checking for updates...")
@@ -147,6 +147,30 @@ local function renderNFPC(mon, data)
     renderLines(mon, lines)
 end
 
+-- Half-block renderer: each file line = "topColours|botColours" (CC hex chars).
+-- Uses the lower-half-block glyph (\x8f in CC:T's font = U+2584 ▄):
+--   foreground colour -> bottom pixel, background colour -> top pixel.
+-- This gives 2x vertical resolution for the same monitor size.
+local HALF_BLOCK = string.char(0x8f)
+local function renderNFPH(mon, data)
+    if not mon then return end
+    local row = 0
+    for line in (data.."\n"):gmatch("([^\n]*)\n") do
+        row = row + 1
+        local ln  = line:gsub("\r", "")
+        local sep = ln:find("|", 1, true)
+        if sep then
+            local top = ln:sub(1, sep - 1)  -- background = top pixel colour
+            local bot = ln:sub(sep + 1)     -- foreground = bottom pixel colour
+            local w   = #top
+            if w > 0 then
+                mon.setCursorPos(1, row)
+                mon.blit(HALF_BLOCK:rep(w), bot, top)
+            end
+        end
+    end
+end
+
 local function playAudio(speakers, name, stats)
     local url = GITHUB_RAW .. "/output/" .. name .. "/audio.dfpwm"
     print(("[player] Streaming audio on %d speaker(s)..."):format(#speakers))
@@ -265,7 +289,8 @@ local function playMedia(mon, speakers, name, manifest)
                 if fs.exists(p) and video then
                     local fh = fs.open(p, "r")
                     local data = fh.readAll(); fh.close()
-                    if fext == "nfpc" then renderNFPC(mon, data)
+                    if fext == "nfph" then renderNFPH(mon, data)
+                    elseif fext == "nfpc" then renderNFPC(mon, data)
                     else renderNFP(mon, data) end
                 end
             else
