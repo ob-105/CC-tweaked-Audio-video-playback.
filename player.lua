@@ -2,7 +2,7 @@
 local GITHUB_RAW = "https://raw.githubusercontent.com/ob-105/CC-tweaked-Audio-video-playback./main"
 local SELF_URL   = GITHUB_RAW .. "/player.lua"
 local SELF_PATH  = "player.lua"
-local VERSION    = "23"
+local VERSION    = "24"
 
 local function selfUpdate()
     print("[player] Checking for updates...")
@@ -147,57 +147,114 @@ local function renderNFPC(mon, data)
     renderLines(mon, lines)
 end
 
--- Half-block renderer: each file line = "topColours|botColours" (CC hex chars).
--- Uses the lower-half-block glyph (\x8f in CC:T's font = U+2584 ▄):
---   foreground colour -> bottom pixel, background colour -> top pixel.
--- This gives 2x vertical resolution for the same monitor size.
+-- Half-block glyph ▄: background = top pixel, foreground = bottom pixel.
 local HALF_BLOCK = string.char(0x8f)
-local function renderNFPH(mon, data)
+
+-- Scale decoded top/bot string arrays to fill the actual monitor size.
+-- Fixes the "zoomed-in top-left" bug when frame dims != monitor dims.
+local function renderHalfLines(mon, topLines, botLines)
     if not mon then return end
-    local row = 0
-    for line in (data.."\n"):gmatch("([^\n]*)\n") do
-        row = row + 1
-        local ln  = line:gsub("\r", "")
-        local sep = ln:find("|", 1, true)
-        if sep then
-            local top = ln:sub(1, sep - 1)  -- background = top pixel colour
-            local bot = ln:sub(sep + 1)     -- foreground = bottom pixel colour
-            local w   = #top
-            if w > 0 then
-                mon.setCursorPos(1, row)
-                mon.blit(HALF_BLOCK:rep(w), bot, top)
-            end
+    local nh = #topLines
+    if nh == 0 then return end
+    local nw = #topLines[1]
+    if nw == 0 then return end
+    local mw, mh = mon.getSize()
+    for row = 1, mh do
+        local srcRow = math.max(1, math.min(nh, math.ceil(row * nh / mh)))
+        local tLine  = topLines[srcRow]
+        local bLine  = botLines[srcRow]
+        local tStr, bStr = {}, {}
+        for col = 1, mw do
+            local srcCol = math.max(1, math.min(nw, math.ceil(col * nw / mw)))
+            tStr[col] = tLine:sub(srcCol, srcCol)
+            bStr[col] = bLine:sub(srcCol, srcCol)
         end
+        mon.setCursorPos(1, row)
+        mon.blit(HALF_BLOCK:rep(mw), table.concat(bStr), table.concat(tStr))
     end
 end
 
--- NFPHC: half-block + RLE. Each line = "topRLE;botRLE" where each side
--- uses the same char:count|char:count encoding as NFPC.
+local function decodeHalfRLE(rle)
+    local s = ""
+    for run in (rle.."|" ):gmatch("([^|]*)|" ) do
+        local c, n = run:match("^(.):(%d+)$")
+        if c and n then s = s .. c:rep(tonumber(n)) end
+    end
+    return s
+end
+
+-- NFPH: half-block, each line = "topColours|botColours"
+local function renderNFPH(mon, data)
+    if not mon then return end
+    local topLines, botLines = {}, {}
+    for line in (data.."\n"):gmatch("([^\n]*)\n") do
+        local ln  = line:gsub("\r", "")
+        local sep = ln:find("|", 1, true)
+        if sep then
+            topLines[#topLines+1] = ln:sub(1, sep - 1)
+            botLines[#botLines+1] = ln:sub(sep + 1)
+        end
+    end
+    renderHalfLines(mon, topLines, botLines)
+end
+
+-- NFPHC: half-block + RLE, each line = "topRLE;botRLE"
 local function renderNFPHC(mon, data)
     if not mon then return end
-    local function decodeRLE(rle)
-        local s = ""
-        for run in (rle.."|" ):gmatch("([^|]*)|" ) do
-            local c, n = run:match("^(.):(%d+)$")
-            if c and n then s = s .. c:rep(tonumber(n)) end
-        end
-        return s
-    end
-    local row = 0
+    local topLines, botLines = {}, {}
     for line in (data.."\n"):gmatch("([^\n]*)\n") do
-        row = row + 1
         local ln  = line:gsub("\r", "")
         local sep = ln:find(";", 1, true)
         if sep then
-            local top = decodeRLE(ln:sub(1, sep - 1))
-            local bot = decodeRLE(ln:sub(sep + 1))
-            local w   = #top
-            if w > 0 then
-                mon.setCursorPos(1, row)
-                mon.blit(HALF_BLOCK:rep(w), bot, top)
+            topLines[#topLines+1] = decodeHalfRLE(ln:sub(1, sep - 1))
+            botLines[#botLines+1] = decodeHalfRLE(ln:sub(sep + 1))
+        end
+    end
+    renderHalfLines(mon, topLines, botLines)
+end
+
+-- NFPHCD: half-block + RLE + delta encoding.
+-- First line of each file: "K" = full keyframe, "D" = delta (unchanged rows = "-").
+-- Returns new {top=..., bot=...} state table for the next frame.
+local function renderNFPHCD(mon, data, prevState)
+    local nl     = data:find("\n")
+    local marker = nl and data:sub(1, nl - 1):gsub("\r", "") or "K"
+    local body   = nl and data:sub(nl + 1) or data
+    local topLines, botLines = {}, {}
+    if marker ~= "D" or not prevState then
+        -- Keyframe: decode every row
+        for line in (body.."\n"):gmatch("([^\n]*)\n") do
+            local ln  = line:gsub("\r", "")
+            local sep = ln:find(";", 1, true)
+            if sep then
+                topLines[#topLines+1] = decodeHalfRLE(ln:sub(1, sep - 1))
+                botLines[#botLines+1] = decodeHalfRLE(ln:sub(sep + 1))
+            end
+        end
+    else
+        -- Delta frame: "-" = keep row from prevState, otherwise new row
+        local prevTop, prevBot = prevState.top, prevState.bot
+        local row = 0
+        for line in (body.."\n"):gmatch("([^\n]*)\n") do
+            row = row + 1
+            local ln = line:gsub("\r", "")
+            if ln == "-" then
+                topLines[row] = prevTop[row] or ""
+                botLines[row] = prevBot[row] or ""
+            else
+                local sep = ln:find(";", 1, true)
+                if sep then
+                    topLines[row] = decodeHalfRLE(ln:sub(1, sep - 1))
+                    botLines[row] = decodeHalfRLE(ln:sub(sep + 1))
+                else
+                    topLines[row] = prevTop[row] or ""
+                    botLines[row] = prevBot[row] or ""
+                end
             end
         end
     end
+    renderHalfLines(mon, topLines, botLines)
+    return { top = topLines, bot = botLines }
 end
 
 local function playAudio(speakers, name, stats, audioData)
@@ -505,6 +562,7 @@ local function playMedia(mon, speakers, name, manifest, store)
         #speakers, tostring(mon ~= nil)))
 
     local fext = manifest.frame_ext or "nfp"
+    local prevHalfState = nil  -- persistent state for nfphcd delta rendering
     local function framePath(i)
         return ("media/%s/frames/%06d.%s"):format(name, i, fext)
     end
@@ -589,7 +647,8 @@ local function playMedia(mon, speakers, name, manifest, store)
                 local wait = due - elapsed
                 if wait > 0 then os.sleep(wait) end
                 if frameData and video then
-                    if fext == "nfphc" then renderNFPHC(mon, frameData)
+                    if fext == "nfphcd" then prevHalfState = renderNFPHCD(mon, frameData, prevHalfState)
+                    elseif fext == "nfphc" then renderNFPHC(mon, frameData)
                     elseif fext == "nfph" then renderNFPH(mon, frameData)
                     elseif fext == "nfpc" then renderNFPC(mon, frameData)
                     else renderNFP(mon, frameData) end

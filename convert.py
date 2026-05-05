@@ -82,6 +82,7 @@ NFP_CHARS = "0123456789abcdef"
 # Precomputed numpy arrays for vectorised colour matching
 _CC_PALETTE_NP = np.array(CC_PALETTE, dtype=np.int32)   # (16, 3)
 _NFP_CHARS_ARR = np.array(list(NFP_CHARS))               # (16,)
+KEY_INTERVAL   = 30  # keyframe every N frames in nfphcd delta mode
 
 
 def image_to_nfp(img, width, height):
@@ -266,9 +267,13 @@ def convert_audio_to_dfpwm(input_path, output_path):
     return duration_seconds
 
 
-def extract_frames(input_path, frames_dir, fps, width, height, compress=False, halfblock=False):
-    """Extract video frames from MP4 and convert to NFP, NFPC, NFPH, or NFPHC."""
-    if halfblock and compress:
+def extract_frames(input_path, frames_dir, fps, width, height, compress=False, halfblock=False, delta=False):
+    """Extract video frames from MP4 and convert to NFP/NFPC/NFPH/NFPHC/NFPHCD."""
+    if halfblock and compress and delta:
+        ext          = "nfphcd"
+        pixel_height = height * 2
+        mode_label   = "NFPHCD half-block+RLE+delta"
+    elif halfblock and compress:
         ext          = "nfphc"
         pixel_height = height * 2
         mode_label   = "NFPHC half-block+RLE"
@@ -285,7 +290,7 @@ def extract_frames(input_path, frames_dir, fps, width, height, compress=False, h
         pixel_height = height
         mode_label   = "NFP"
 
-    all_exts = ["nfp", "nfpc", "nfph", "nfphc"]
+    all_exts = ["nfp", "nfpc", "nfph", "nfphc", "nfphcd"]
     old_exts = [e for e in all_exts if e != ext]
 
     print(f"  Extracting frames at {fps} FPS ({width}x{pixel_height}) [{ext}]...")
@@ -313,28 +318,74 @@ def extract_frames(input_path, frames_dir, fps, width, height, compress=False, h
 
         png_files = sorted(f for f in os.listdir(tmp_dir) if f.endswith(".png"))
         total = len(png_files)
-        print(f"  Converting {total} frames to {mode_label} (parallel)...")
+        mode_str = "sequential+delta" if delta else "parallel"
+        print(f"  Converting {total} frames to {mode_label} ({mode_str})...")
 
-        worker_args = [
-            (
-                os.path.join(tmp_dir, pf),
-                os.path.join(frames_dir, f"{i + 1:06d}.{ext}"),
-                width,
-                pixel_height,
-                compress,
-                halfblock,
-            )
-            for i, pf in enumerate(png_files)
-        ]
-
-        from concurrent.futures import ProcessPoolExecutor
-        cpu = max(1, os.cpu_count() or 1)
         done = 0
-        with ProcessPoolExecutor(max_workers=cpu) as pool:
-            for _ in pool.map(_frame_worker, worker_args, chunksize=4):
+        if delta:
+            # Sequential: each frame depends on the previous for delta computation
+            from PIL import Image as _Img
+            _pal = np.array(CC_PALETTE, dtype=np.int32)
+            _ch  = np.array(list(NFP_CHARS))
+            def _match_rows(rows):
+                d = rows[:, :, np.newaxis, :] - _pal
+                return (d ** 2).sum(axis=-1).argmin(axis=-1)
+            def _rle_row(chars):
+                runs = []; cur = chars[0]; count = 1
+                for c in chars[1:]:
+                    if c == cur: count += 1
+                    else: runs.append(f"{cur}:{count}"); cur = c; count = 1
+                runs.append(f"{cur}:{count}")
+                return "|".join(runs)
+            prev_top = None
+            prev_bot = None
+            for i, pf in enumerate(png_files):
+                out_path = os.path.join(frames_dir, f"{i + 1:06d}.{ext}")
+                img = _Img.open(os.path.join(tmp_dir, pf)).resize(
+                    (width, pixel_height), _Img.LANCZOS).convert("RGB")
+                px        = np.array(img, dtype=np.int32)
+                top_chars = _ch[_match_rows(px[0::2])]
+                bot_chars = _ch[_match_rows(px[1::2])]
+                is_key = (prev_top is None or i % KEY_INTERVAL == 0)
+                if is_key:
+                    rows = [_rle_row(top_chars[r]) + ";" + _rle_row(bot_chars[r])
+                            for r in range(top_chars.shape[0])]
+                    data = "K\n" + "\n".join(rows)
+                else:
+                    rows = []
+                    for r in range(top_chars.shape[0]):
+                        if np.array_equal(top_chars[r], prev_top[r]) and \
+                           np.array_equal(bot_chars[r], prev_bot[r]):
+                            rows.append("-")
+                        else:
+                            rows.append(_rle_row(top_chars[r]) + ";" + _rle_row(bot_chars[r]))
+                    data = "D\n" + "\n".join(rows)
+                with open(out_path, "w", newline="\n") as f:
+                    f.write(data)
+                prev_top = top_chars
+                prev_bot = bot_chars
                 done += 1
                 if done % 10 == 0 or done == total:
                     print(f"    {done}/{total} frames done", end="\r")
+        else:
+            worker_args = [
+                (
+                    os.path.join(tmp_dir, pf),
+                    os.path.join(frames_dir, f"{i + 1:06d}.{ext}"),
+                    width,
+                    pixel_height,
+                    compress,
+                    halfblock,
+                )
+                for i, pf in enumerate(png_files)
+            ]
+            from concurrent.futures import ProcessPoolExecutor
+            cpu = max(1, os.cpu_count() or 1)
+            with ProcessPoolExecutor(max_workers=cpu) as pool:
+                for _ in pool.map(_frame_worker, worker_args, chunksize=4):
+                    done += 1
+                    if done % 10 == 0 or done == total:
+                        print(f"    {done}/{total} frames done", end="\r")
 
         print()
         return total
@@ -407,7 +458,7 @@ def git_push(message):
 # ---------------------------------------------------------------------------
 # Convert a single file
 # ---------------------------------------------------------------------------
-def convert_file(input_path, fps, monitors_x, monitors_y, compress=False, halfblock=False):
+def convert_file(input_path, fps, monitors_x, monitors_y, compress=False, halfblock=False, delta=False):
     monitor_w = 51
     monitor_h = 19
     width  = monitor_w * monitors_x
@@ -437,7 +488,7 @@ def convert_file(input_path, fps, monitors_x, monitors_y, compress=False, halfbl
         "height": height,
         "monitors_x": monitors_x,
         "monitors_y": monitors_y,
-        "frame_ext": ("nfphc" if compress else "nfph") if halfblock else ("nfpc" if compress else "nfp"),
+        "frame_ext": ("nfphcd" if delta else "nfphc") if (halfblock and compress) else ("nfph" if halfblock else ("nfpc" if compress else "nfp")),
     }
 
     audio_path = os.path.join(output_dir, "audio.dfpwm")
@@ -446,7 +497,7 @@ def convert_file(input_path, fps, monitors_x, monitors_y, compress=False, halfbl
 
     if is_video:
         frames_dir = os.path.join(output_dir, "frames")
-        frame_count = extract_frames(input_path, frames_dir, fps, width, height, compress, halfblock)
+        frame_count = extract_frames(input_path, frames_dir, fps, width, height, compress, halfblock, delta)
         manifest["frame_count"] = frame_count
     else:
         manifest["has_video"] = "false"
@@ -526,9 +577,25 @@ def launch_gui():
     ttk.Checkbutton(sf, text="Half-block rendering \u2584  (2\u00d7 vertical resolution; combinable with RLE)",
                     variable=var_halfblock).grid(row=4, column=0, columnspan=5, sticky="w", pady=(2, 0))
 
+    var_delta = tk.BooleanVar(value=False)
+    cb_delta = ttk.Checkbutton(sf,
+        text="Delta encoding (only store changed rows; requires ▄+RLE; best compression)",
+        variable=var_delta, state="disabled")
+    cb_delta.grid(row=5, column=0, columnspan=5, sticky="w", pady=(2, 0))
+
+    def on_delta_prereq_toggle(*_):
+        if var_halfblock.get() and var_compress.get():
+            cb_delta.configure(state="normal")
+        else:
+            var_delta.set(False)
+            cb_delta.configure(state="disabled")
+
+    var_halfblock.trace_add("write", on_delta_prereq_toggle)
+    var_compress.trace_add("write", on_delta_prereq_toggle)
+
     var_push = tk.BooleanVar(value=True)
     ttk.Checkbutton(sf, text="Auto-push to GitHub after converting", variable=var_push).grid(
-        row=5, column=0, columnspan=5, sticky="w", pady=(2, 0))
+        row=6, column=0, columnspan=5, sticky="w", pady=(2, 0))
 
     # ── File list ─────────────────────────────────────────────────────────
     ff = ttk.LabelFrame(root, text="Files in  input/", padding=10)
@@ -601,8 +668,9 @@ def launch_gui():
             converted = []
             compress   = var_compress.get()
             halfblock  = var_halfblock.get()
+            delta      = var_delta.get()
             for input_path in files:
-                media_name, is_video = convert_file(input_path, fps, mx, my, compress, halfblock)
+                media_name, is_video = convert_file(input_path, fps, mx, my, compress, halfblock, delta)
                 if is_video:
                     if media_name not in video_list:
                         video_list.append(media_name)
