@@ -2,7 +2,7 @@
 local GITHUB_RAW = "https://raw.githubusercontent.com/ob-105/CC-tweaked-Audio-video-playback./main"
 local SELF_URL   = GITHUB_RAW .. "/player.lua"
 local SELF_PATH  = "player.lua"
-local VERSION    = "16"
+local VERSION    = "17"
 
 local function selfUpdate()
     print("[player] Checking for updates...")
@@ -147,28 +147,48 @@ local function renderNFPC(mon, data)
     renderLines(mon, lines)
 end
 
-local function playAudio(speakers, name)
+local function playAudio(speakers, name, stats)
     local url = GITHUB_RAW .. "/output/" .. name .. "/audio.dfpwm"
     print(("[player] Streaming audio on %d speaker(s)..."):format(#speakers))
     local res = http.get(url, nil, true)
-    if not res then print("[player] Audio fetch failed."); return end
-    local dfpwm = require("cc.audio.dfpwm")
+    if not res then
+        print("[player] Audio fetch FAILED.")
+        if stats then stats.audioFailed = true end
+        return
+    end
+    local dfpwm   = require("cc.audio.dfpwm")
     local decoder = dfpwm.make_decoder()
+    local stalls  = 0
     while true do
+        local t0chunk = os.clock()
         local chunk = res.read(16384)
         if not chunk then break end
-        local pcm = decoder(chunk)
-        -- Play to all speakers simultaneously; wait if any is busy
+        local fetchTime = os.clock() - t0chunk
+        if fetchTime > 0.5 then
+            stalls = stalls + 1
+            if stats then stats.audioStalls = (stats.audioStalls or 0) + 1 end
+            print(("\n[warn] Audio HTTP slow: %.2fs"):format(fetchTime))
+        end
+        local pcm  = decoder(chunk)
         local busy = true
+        local underrun = false
         while busy do
             busy = false
             for _, spk in ipairs(speakers) do
                 if not spk.playAudio(pcm) then busy = true end
             end
-            if busy then os.pullEvent("speaker_audio_empty") end
+            if busy then
+                underrun = true
+                os.pullEvent("speaker_audio_empty")
+            end
+        end
+        if underrun then
+            stalls = stalls + 1
+            if stats then stats.audioStalls = (stats.audioStalls or 0) + 1 end
         end
     end
     res.close()
+    if stats then stats.audioStalls = stalls end
 end
 
 local function calcBuffer(manifest)
@@ -203,18 +223,43 @@ local function playMedia(mon, speakers, name, manifest)
         return ("%s/output/%s/frames/%06d.%s"):format(GITHUB_RAW, name, i, fext)
     end
 
-    -- No pre-fetch burst: the rolling loop downloads ahead safely one frame at a time
+    -- Shared stats table written by both loops
+    local stats = { skipped=0, dlSlow=0, dlFailed=0, audioStalls=0, audioFailed=false }
+    local framePeriod = 1 / fps
+    local totalSecs   = count / fps
+
     local t0 = os.clock()
-    local skipped = 0
     local function videoLoop()
         for frame = 1, count do
-            local due = (frame - 1) / fps  -- seconds this frame is due
+            local due     = (frame - 1) * framePeriod
             local elapsed = os.clock() - t0
-            -- If we're more than one frame period behind, skip rendering (keep audio sync)
-            local p = framePath(frame)
-            if not fs.exists(p) then download(frameURL(frame), p) end
-            if elapsed <= due + (1 / fps) then
-                -- On time (or close enough): wait if early, then render
+            local p       = framePath(frame)
+
+            -- Download current frame if not already cached
+            if not fs.exists(p) then
+                local dlT0 = os.clock()
+                local ok   = download(frameURL(frame), p)
+                local dlMs = math.floor((os.clock() - dlT0) * 1000)
+                if not ok then
+                    stats.dlFailed = stats.dlFailed + 1
+                    print(("\n[warn] Frame %d download FAILED"):format(frame))
+                elseif dlMs > framePeriod * 1000 then
+                    stats.dlSlow = stats.dlSlow + 1
+                    print(("\n[warn] Frame %d download slow (%dms, budget %dms)"):format(
+                        frame, dlMs, math.floor(framePeriod * 1000)))
+                end
+            end
+
+            -- Live status line (overwrites itself)
+            local timeLeft = math.max(0, totalSecs - elapsed)
+            term.write(("\r  Frame %d/%d (%d%%)  %.0fs left  skip=%d  slow=%d  fail=%d   "):format(
+                frame, count,
+                math.floor(frame * 100 / count),
+                timeLeft,
+                stats.skipped, stats.dlSlow, stats.dlFailed))
+
+            elapsed = os.clock() - t0
+            if elapsed <= due + framePeriod then
                 local wait = due - elapsed
                 if wait > 0 then os.sleep(wait) end
                 if fs.exists(p) and video then
@@ -224,22 +269,32 @@ local function playMedia(mon, speakers, name, manifest)
                     else renderNFP(mon, data) end
                 end
             else
-                -- Behind: skip render, catch up
-                skipped = skipped + 1
+                stats.skipped = stats.skipped + 1
             end
             if fs.exists(p) then fs.delete(p) end
-            -- Download the next lookahead frame only if there is room
+
+            -- Lookahead: pre-fetch next buffer frame if space allows
             local nx = frame + FRAME_BUFFER
             if nx <= count and fs.getFreeSpace("/") > 400 * 1024 then
                 download(frameURL(nx), framePath(nx))
             end
         end
-        if skipped > 0 then print(("[player] Skipped %d frame(s) to maintain sync."):format(skipped)) end
+        print()  -- newline after the final status line
     end
-    local function audioLoop() if audio and #speakers > 0 then playAudio(speakers, name) end end
+    local function audioLoop()
+        if audio and #speakers > 0 then playAudio(speakers, name, stats) end
+    end
     if audio and video and count > 0 then parallel.waitForAll(audioLoop, videoLoop)
     elseif audio then audioLoop()
     elseif count > 0 then videoLoop() end
+
+    -- Playback summary
+    print("[player] Playback complete.")
+    if stats.skipped   > 0 then print(("  Skipped frames : %d"):format(stats.skipped)) end
+    if stats.dlSlow    > 0 then print(("  Slow downloads : %d"):format(stats.dlSlow)) end
+    if stats.dlFailed  > 0 then print(("  Failed downloads: %d"):format(stats.dlFailed)) end
+    if stats.audioStalls > 0 then print(("  Audio stalls   : %d"):format(stats.audioStalls)) end
+    if stats.audioFailed   then print("  Audio          : FAILED to fetch") end
     -- Clean up any leftover buffered frames (downloaded but not yet rendered)
     local mediaDir = "media/"..name
     if fs.exists(mediaDir) then fs.delete(mediaDir) end
