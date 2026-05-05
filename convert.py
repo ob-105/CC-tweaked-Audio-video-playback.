@@ -117,66 +117,67 @@ def image_to_nfpc(img, width, height):
     return "\n".join(rows)
 
 
+def _dither_to_chars(px_f, _np, _palf, _ch):
+    """Floyd-Steinberg dithering. px_f is float32 (H, W, 3). Returns char array (H, W)."""
+    H, W = px_f.shape[:2]
+    idx_grid = _np.zeros((H, W), dtype=_np.int32)
+    for r in range(H):
+        for c in range(W):
+            old = px_f[r, c].clip(0.0, 255.0)
+            d   = _palf - old          # (16, 3)
+            idx = int((d * d).sum(axis=1).argmin())
+            idx_grid[r, c] = idx
+            err = old - _palf[idx]     # quantisation error
+            if c + 1 < W:              px_f[r,   c + 1] += err * (7.0 / 16)
+            if r + 1 < H:
+                if c > 0:              px_f[r + 1, c - 1] += err * (3.0 / 16)
+                px_f[r + 1, c]        += err * (5.0 / 16)
+                if c + 1 < W:          px_f[r + 1, c + 1] += err * (1.0 / 16)
+    return _ch[idx_grid]
+
+
 def _frame_worker(args):
-    """Top-level worker used by ProcessPoolExecutor for parallel NFP/NFPC/NFPH conversion."""
-    png_path, out_path, width, height, compress, halfblock = args
+    """Top-level worker used by ProcessPoolExecutor for parallel NFP/NFPC/NFPH/NFPHC conversion."""
+    png_path, out_path, width, height, compress, halfblock, dither = args
     from PIL import Image as _Img
     import numpy as _np
-    _pal = _np.array(CC_PALETTE, dtype=_np.int32)
-    _ch  = _np.array(list(NFP_CHARS))
-    img  = _Img.open(png_path).resize((width, height), _Img.LANCZOS).convert("RGB")
-    px   = _np.array(img, dtype=_np.int32)  # (height, width, 3)
+    _pal  = _np.array(CC_PALETTE, dtype=_np.int32)
+    _palf = _pal.astype(_np.float32)
+    _ch   = _np.array(list(NFP_CHARS))
+    img   = _Img.open(png_path).resize((width, height), _Img.LANCZOS).convert("RGB")
+
+    if dither:
+        char_grid = _dither_to_chars(_np.array(img, dtype=_np.float32), _np, _palf, _ch)
+    else:
+        px        = _np.array(img, dtype=_np.int32)
+        diff      = px[:, :, _np.newaxis, :] - _pal
+        char_grid = _ch[(diff ** 2).sum(axis=-1).argmin(axis=-1)]
+
+    def _rle_row(row):
+        runs = []; cur = row[0]; count = 1
+        for c in row[1:]:
+            if c == cur: count += 1
+            else: runs.append(f"{cur}:{count}"); cur = c; count = 1
+        runs.append(f"{cur}:{count}")
+        return "|".join(runs)
 
     if halfblock:
-        # height = 2 * char_rows; pair pixel rows for top/bottom of each cell
-        top_px = px[0::2]  # even rows -> top half (background colour)
-        bot_px = px[1::2]  # odd rows  -> bottom half (foreground colour, ▄ glyph)
-        def _match(rows):
-            d = rows[:, :, _np.newaxis, :] - _pal
-            return (d ** 2).sum(axis=-1).argmin(axis=-1)
-        top_chars = _ch[_match(top_px)]  # (char_rows, width)
-        bot_chars = _ch[_match(bot_px)]
+        top_chars = char_grid[0::2]
+        bot_chars = char_grid[1::2]
         if compress:
-            def _rle(chars):
-                runs = []
-                cur = chars[0]; count = 1
-                for c in chars[1:]:
-                    if c == cur:
-                        count += 1
-                    else:
-                        runs.append(f"{cur}:{count}")
-                        cur = c; count = 1
-                runs.append(f"{cur}:{count}")
-                return "|".join(runs)
-            rows = [_rle(top_chars[i]) + ";" + _rle(bot_chars[i])
+            rows = [_rle_row(top_chars[i]) + ";" + _rle_row(bot_chars[i])
                     for i in range(top_chars.shape[0])]
         else:
             rows = ["".join(top_chars[i]) + "|" + "".join(bot_chars[i])
                     for i in range(top_chars.shape[0])]
-        data = "\n".join(rows)
     else:
-        diff      = px[:, :, _np.newaxis, :] - _pal
-        idx       = (diff ** 2).sum(axis=-1).argmin(axis=-1)
-        char_grid = _ch[idx]
         if compress:
-            rows = []
-            for row in char_grid:
-                runs = []
-                cur = row[0]; count = 1
-                for c in row[1:]:
-                    if c == cur:
-                        count += 1
-                    else:
-                        runs.append(f"{cur}:{count}")
-                        cur = c; count = 1
-                runs.append(f"{cur}:{count}")
-                rows.append("|".join(runs))
-            data = "\n".join(rows)
+            rows = [_rle_row(row) for row in char_grid]
         else:
-            data = "\n".join("".join(row) for row in char_grid)
+            rows = ["".join(row) for row in char_grid]
 
     with open(out_path, "w", newline="\n") as f:
-        f.write(data)
+        f.write("\n".join(rows))
     return out_path
 
 
@@ -267,7 +268,7 @@ def convert_audio_to_dfpwm(input_path, output_path):
     return duration_seconds
 
 
-def extract_frames(input_path, frames_dir, fps, width, height, compress=False, halfblock=False, delta=False):
+def extract_frames(input_path, frames_dir, fps, width, height, compress=False, halfblock=False, delta=False, dither=False):
     """Extract video frames from MP4 and convert to NFP/NFPC/NFPH/NFPHC/NFPHCD."""
     if halfblock and compress and delta:
         ext          = "nfphcd"
@@ -325,8 +326,9 @@ def extract_frames(input_path, frames_dir, fps, width, height, compress=False, h
         if delta:
             # Sequential: each frame depends on the previous for delta computation
             from PIL import Image as _Img
-            _pal = np.array(CC_PALETTE, dtype=np.int32)
-            _ch  = np.array(list(NFP_CHARS))
+            _pal  = np.array(CC_PALETTE, dtype=np.int32)
+            _palf = _pal.astype(np.float32)
+            _ch   = np.array(list(NFP_CHARS))
             def _match_rows(rows):
                 d = rows[:, :, np.newaxis, :] - _pal
                 return (d ** 2).sum(axis=-1).argmin(axis=-1)
@@ -343,9 +345,14 @@ def extract_frames(input_path, frames_dir, fps, width, height, compress=False, h
                 out_path = os.path.join(frames_dir, f"{i + 1:06d}.{ext}")
                 img = _Img.open(os.path.join(tmp_dir, pf)).resize(
                     (width, pixel_height), _Img.LANCZOS).convert("RGB")
-                px        = np.array(img, dtype=np.int32)
-                top_chars = _ch[_match_rows(px[0::2])]
-                bot_chars = _ch[_match_rows(px[1::2])]
+                if dither:
+                    cg      = _dither_to_chars(np.array(img, dtype=np.float32), np, _palf, _ch)
+                    top_chars = cg[0::2]
+                    bot_chars = cg[1::2]
+                else:
+                    px        = np.array(img, dtype=np.int32)
+                    top_chars = _ch[_match_rows(px[0::2])]
+                    bot_chars = _ch[_match_rows(px[1::2])]
                 is_key = (prev_top is None or i % KEY_INTERVAL == 0)
                 if is_key:
                     rows = [_rle_row(top_chars[r]) + ";" + _rle_row(bot_chars[r])
@@ -376,6 +383,7 @@ def extract_frames(input_path, frames_dir, fps, width, height, compress=False, h
                     pixel_height,
                     compress,
                     halfblock,
+                    dither,
                 )
                 for i, pf in enumerate(png_files)
             ]
@@ -458,7 +466,7 @@ def git_push(message):
 # ---------------------------------------------------------------------------
 # Convert a single file
 # ---------------------------------------------------------------------------
-def convert_file(input_path, fps, monitors_x, monitors_y, compress=False, halfblock=False, delta=False):
+def convert_file(input_path, fps, monitors_x, monitors_y, compress=False, halfblock=False, delta=False, dither=False):
     monitor_w = 51
     monitor_h = 19
     width  = monitor_w * monitors_x
@@ -497,7 +505,7 @@ def convert_file(input_path, fps, monitors_x, monitors_y, compress=False, halfbl
 
     if is_video:
         frames_dir = os.path.join(output_dir, "frames")
-        frame_count = extract_frames(input_path, frames_dir, fps, width, height, compress, halfblock, delta)
+        frame_count = extract_frames(input_path, frames_dir, fps, width, height, compress, halfblock, delta, dither)
         manifest["frame_count"] = frame_count
     else:
         manifest["has_video"] = "false"
@@ -669,8 +677,9 @@ def launch_gui():
             compress   = var_compress.get()
             halfblock  = var_halfblock.get()
             delta      = var_delta.get()
+            dither     = var_dither.get()
             for input_path in files:
-                media_name, is_video = convert_file(input_path, fps, mx, my, compress, halfblock, delta)
+                media_name, is_video = convert_file(input_path, fps, mx, my, compress, halfblock, delta, dither)
                 if is_video:
                     if media_name not in video_list:
                         video_list.append(media_name)
