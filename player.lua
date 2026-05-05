@@ -2,7 +2,7 @@
 local GITHUB_RAW = "https://raw.githubusercontent.com/ob-105/CC-tweaked-Audio-video-playback./main"
 local SELF_URL   = GITHUB_RAW .. "/player.lua"
 local SELF_PATH  = "player.lua"
-local VERSION    = "19"
+local VERSION    = "20"
 
 local function selfUpdate()
     print("[player] Checking for updates...")
@@ -171,7 +171,7 @@ local function renderNFPH(mon, data)
     end
 end
 
-local function playAudio(speakers, name, stats)
+local function playAudio(speakers, name, stats, audioData)
     local dfpwm   = require("cc.audio.dfpwm")
     local decoder = dfpwm.make_decoder()
     local stalls  = 0
@@ -205,13 +205,22 @@ local function playAudio(speakers, name, stats)
                 if stats then stats.audioStalls = (stats.audioStalls or 0) + 1 end
             end
         end
-        closeFn()
+        if closeFn then closeFn() end
     end
 
-    local localPath = "media/" .. name .. "/audio.dfpwm"
-    if fs.exists(localPath) then
+    if audioData then
+        -- Play from in-memory string fetched from the storage network
+        print("[player] Playing audio from storage network...")
+        local pos = 1
+        processChunks(function()
+            if pos > #audioData then return nil end
+            local chunk = audioData:sub(pos, pos + 16383)
+            pos = pos + 16384
+            return chunk
+        end, nil)
+    elseif fs.exists("media/" .. name .. "/audio.dfpwm") then
         print("[player] Playing audio from local cache...")
-        local fh = fs.open(localPath, "rb")
+        local fh = fs.open("media/" .. name .. "/audio.dfpwm", "rb")
         if not fh then
             if stats then stats.audioFailed = true end; return
         end
@@ -228,6 +237,93 @@ local function playAudio(speakers, name, stats)
     end
 
     if stats then stats.audioStalls = stalls end
+end
+
+-- ---------------------------------------------------------------------------
+-- Storage network helpers
+-- ---------------------------------------------------------------------------
+local STORAGE_API_URL = "https://raw.githubusercontent.com/ob-105/CC-Tweaked-General-Purpose-Storage-Network/main/storage_api.lua"
+
+local function initStore()
+    if not fs.exists("storage_api.lua") then
+        io.write("[net] Downloading storage_api.lua... ")
+        local ok = download(STORAGE_API_URL, "storage_api.lua")
+        print(ok and "OK" or "FAILED")
+        if not ok then return nil end
+    end
+    local ok, store = pcall(require, "storage_api")
+    if not ok then
+        print("[net] storage_api load failed: " .. tostring(store))
+        return nil
+    end
+    return store
+end
+
+local function uploadToNetwork(name, manifest, store)
+    local count = manifest.frame_count or 0
+    local fext  = manifest.frame_ext or "nfp"
+    local audio = manifest.has_audio == "true"
+    local video = manifest.has_video == "true"
+
+    term.clear(); term.setCursorPos(1,1)
+    print(("=== Uploading '%s' to storage network ==="):format(name))
+
+    -- Check network stats before starting
+    local info = store.stats()
+    if info then
+        print(("  Network: %d node(s)  %d KB free"):format(
+            #info.nodes, math.floor(info.totalFree / 1024)))
+    end
+
+    -- Audio
+    if audio then
+        local audioKey = "media/" .. name .. "/audio"
+        if store.exists(audioKey) then
+            print("  Audio: already in network.")
+        else
+            io.write("  Fetching audio from GitHub... ")
+            local res = http.get(GITHUB_RAW .. "/output/" .. name .. "/audio.dfpwm", nil, true)
+            if not res then
+                print("FAILED")
+            else
+                local data = res.readAll(); res.close()
+                print(("OK (%d KB)"):format(math.ceil(#data / 1024)))
+                io.write("  Uploading audio to network... ")
+                local ok, err = store.put(audioKey, data)
+                print(ok and "OK" or ("FAILED: " .. tostring(err)))
+            end
+        end
+    end
+
+    -- Frames
+    if video and count > 0 then
+        local failed = 0
+        for i = 1, count do
+            local frameKey = ("media/%s/frames/%06d"):format(name, i)
+            if not store.exists(frameKey) then
+                local url = ("%s/output/%s/frames/%06d.%s"):format(GITHUB_RAW, name, i, fext)
+                local res = http.get(url)
+                if not res then
+                    failed = failed + 1
+                else
+                    local data = res.readAll(); res.close()
+                    local ok, err = store.put(frameKey, data)
+                    if not ok then failed = failed + 1 end
+                end
+            end
+            term.write(("\r  Frames %d/%d (%d%%)  fail=%d   "):format(
+                i, count, math.floor(i * 100 / count), failed))
+        end
+        print()
+        if failed > 0 then
+            print(("[warn] %d item(s) failed to upload."):format(failed))
+        else
+            print("[net] Upload complete. All frames in network.")
+        end
+    end
+
+    print("\n[net] Ready — press Enter to start playback.")
+    io.read()
 end
 
 local function preDownload(name, manifest)
@@ -295,13 +391,15 @@ local function mediaActionMenu(name)
     print(("  %s"):format(name))
     print("=================================")
     print("  1. Play now  (stream on demand)")
-    print("  2. Pre-download then play")
+    print("  2. Pre-download to local disk")
+    print("  3. Upload to storage network")
     print("---------------------------------")
     print("  0. Back"); print()
     io.write("Choice: ")
     local n = tonumber(io.read())
     if n == 1 then return "play"
     elseif n == 2 then return "predownload"
+    elseif n == 3 then return "network"
     else return nil end
 end
 
@@ -318,13 +416,14 @@ local function calcBuffer(manifest)
     return math.max(1, math.min(buf, 60))  -- clamp: at least 1, at most 60
 end
 
-local function playMedia(mon, speakers, name, manifest)
+local function playMedia(mon, speakers, name, manifest, store)
     local fps   = manifest.fps or 5
     local count = manifest.frame_count or 0
     local audio = manifest.has_audio == "true"
     local video = manifest.has_video == "true" and mon ~= nil
     local FRAME_BUFFER = calcBuffer(manifest)
-    print(("[player] Playing '%s'  buffer=%d frames"):format(name, FRAME_BUFFER))
+    local source = store and "network" or "stream/disk"
+    print(("[player] Playing '%s'  source=%s  buffer=%d frames"):format(name, source, FRAME_BUFFER))
     print(("[player] frames=%d  audio=%s  video=%s  speakers=%d  monitor=%s"):format(
         count, tostring(audio), tostring(video),
         #speakers, tostring(mon ~= nil)))
@@ -342,25 +441,62 @@ local function playMedia(mon, speakers, name, manifest)
     local framePeriod = 1 / fps
     local totalSecs   = count / fps
 
+    -- For network playback, pre-fetch audio from the store into memory so the
+    -- audioLoop can play it without any HTTP during playback.
+    local audioData = nil
+    if store and audio then
+        io.write("[player] Fetching audio from network... ")
+        local data, err = store.get("media/" .. name .. "/audio")
+        if data then
+            audioData = data
+            print(("OK (%d KB)"):format(math.ceil(#data / 1024)))
+        else
+            print("FAILED: " .. tostring(err))
+            stats.audioFailed = true
+        end
+    end
+
     local t0 = os.clock()
     local function videoLoop()
         for frame = 1, count do
             local due     = (frame - 1) * framePeriod
             local elapsed = os.clock() - t0
-            local p       = framePath(frame)
+            local frameData = nil
 
-            -- Download current frame if not already cached
-            if not fs.exists(p) then
+            if store then
+                -- Fetch frame from storage network
                 local dlT0 = os.clock()
-                local ok   = download(frameURL(frame), p)
+                local key  = ("media/%s/frames/%06d"):format(name, frame)
+                local data, err = store.get(key)
                 local dlMs = math.floor((os.clock() - dlT0) * 1000)
-                if not ok then
+                if data then
+                    frameData = data
+                    if dlMs > framePeriod * 1000 then
+                        stats.dlSlow = stats.dlSlow + 1
+                    end
+                else
                     stats.dlFailed = stats.dlFailed + 1
-                    print(("\n[warn] Frame %d download FAILED"):format(frame))
-                elseif dlMs > framePeriod * 1000 then
-                    stats.dlSlow = stats.dlSlow + 1
-                    print(("\n[warn] Frame %d download slow (%dms, budget %dms)"):format(
-                        frame, dlMs, math.floor(framePeriod * 1000)))
+                    print(("\n[warn] Frame %d network FAILED: %s"):format(frame, tostring(err)))
+                end
+            else
+                -- Download to local disk (original streaming path)
+                local p = framePath(frame)
+                if not fs.exists(p) then
+                    local dlT0 = os.clock()
+                    local ok   = download(frameURL(frame), p)
+                    local dlMs = math.floor((os.clock() - dlT0) * 1000)
+                    if not ok then
+                        stats.dlFailed = stats.dlFailed + 1
+                        print(("\n[warn] Frame %d download FAILED"):format(frame))
+                    elseif dlMs > framePeriod * 1000 then
+                        stats.dlSlow = stats.dlSlow + 1
+                        print(("\n[warn] Frame %d download slow (%dms, budget %dms)"):format(
+                            frame, dlMs, math.floor(framePeriod * 1000)))
+                    end
+                end
+                if fs.exists(p) then
+                    local fh = fs.open(p, "r")
+                    if fh then frameData = fh.readAll(); fh.close() end
                 end
             end
 
@@ -376,28 +512,29 @@ local function playMedia(mon, speakers, name, manifest)
             if elapsed <= due + framePeriod then
                 local wait = due - elapsed
                 if wait > 0 then os.sleep(wait) end
-                if fs.exists(p) and video then
-                    local fh = fs.open(p, "r")
-                    local data = fh.readAll(); fh.close()
-                    if fext == "nfph" then renderNFPH(mon, data)
-                    elseif fext == "nfpc" then renderNFPC(mon, data)
-                    else renderNFP(mon, data) end
+                if frameData and video then
+                    if fext == "nfph" then renderNFPH(mon, frameData)
+                    elseif fext == "nfpc" then renderNFPC(mon, frameData)
+                    else renderNFP(mon, frameData) end
                 end
             else
                 stats.skipped = stats.skipped + 1
             end
-            if fs.exists(p) then fs.delete(p) end
 
-            -- Lookahead: pre-fetch next buffer frame if space allows
-            local nx = frame + FRAME_BUFFER
-            if nx <= count and fs.getFreeSpace("/") > 400 * 1024 then
-                download(frameURL(nx), framePath(nx))
+            if not store then
+                -- Local disk: delete rendered frame and pre-fetch lookahead
+                local p = framePath(frame)
+                if fs.exists(p) then fs.delete(p) end
+                local nx = frame + FRAME_BUFFER
+                if nx <= count and fs.getFreeSpace("/") > 400 * 1024 then
+                    download(frameURL(nx), framePath(nx))
+                end
             end
         end
         print()  -- newline after the final status line
     end
     local function audioLoop()
-        if audio and #speakers > 0 then playAudio(speakers, name, stats) end
+        if audio and #speakers > 0 then playAudio(speakers, name, stats, audioData) end
     end
     if audio and video and count > 0 then parallel.waitForAll(audioLoop, videoLoop)
     elseif audio then audioLoop()
@@ -479,8 +616,21 @@ local function main()
             if not ok then print("[error] "..tostring(manifest)); print("Press Enter..."); io.read()
             else
                 local subaction = mediaActionMenu(pick)
-                if subaction == "predownload" then preDownload(pick, manifest) end
-                if subaction then playMedia(mon, speakers, pick, manifest) end
+                if subaction == "predownload" then
+                    preDownload(pick, manifest)
+                    playMedia(mon, speakers, pick, manifest, nil)
+                elseif subaction == "network" then
+                    local store = initStore()
+                    if store then
+                        uploadToNetwork(pick, manifest, store)
+                        playMedia(mon, speakers, pick, manifest, store)
+                    else
+                        print("[error] Could not connect to storage network.")
+                        print("Press Enter..."); io.read()
+                    end
+                elseif subaction == "play" then
+                    playMedia(mon, speakers, pick, manifest, nil)
+                end
             end
         end
     end
