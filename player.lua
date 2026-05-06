@@ -2,7 +2,7 @@
 local GITHUB_RAW = "https://raw.githubusercontent.com/ob-105/CC-tweaked-Audio-video-playback./main"
 local SELF_URL   = GITHUB_RAW .. "/player.lua"
 local SELF_PATH  = "player.lua"
-local VERSION    = "31"
+local VERSION    = "32"
 local BASE_URL   = GITHUB_RAW  -- set at startup; may be overridden by tunnel URL
 
 local function selfUpdate()
@@ -297,7 +297,7 @@ local function playAudio(speakers, name, stats, audioData, stopped)
                 if stats then stats.audioStalls = (stats.audioStalls or 0) + 1 end
             end
         end
-        if closeFn then closeFn() end
+        if closeFn then pcall(closeFn) end
     end
 
     if audioData then
