@@ -696,7 +696,7 @@ def launch_gui():
 
     ttk.Label(ss_url_f,
               text="Start the Server tab first, then use its Tunnel URL in screenshare.lua.\n"
-                   "The Lua script will fetch:  <tunnel_url>/screenshare/frame",
+                   "Paste the BASE tunnel URL below — screenshare.lua adds /screenshare/frame.",
               foreground="#555").pack(anchor="w")
 
     ss_hint_var = tk.StringVar(value="(start Server tab to see URL)")
@@ -717,7 +717,7 @@ def launch_gui():
     def _ss_sync_url(*_):
         u = url_var.get()
         if u:
-            ss_hint_var.set(u + "/screenshare/frame")
+            ss_hint_var.set(u)   # base URL only — screenshare.lua appends /screenshare/frame
         else:
             ss_hint_var.set("(start Server tab to see URL)")
     url_var.trace_add("write", _ss_sync_url)

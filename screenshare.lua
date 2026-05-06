@@ -91,8 +91,8 @@ local errors     = 0
 local URL        = BASE .. "/screenshare/frame"
 
 while true do
-    local ok, res = pcall(http.get, URL)
-    if ok and res then
+    local res, err = http.get(URL)
+    if res then
         local data = res.readAll()
         res.close()
         errors = 0
@@ -115,12 +115,13 @@ while true do
     else
         errors = errors + 1
         term.setCursorPos(1, 1); term.clearLine()
-        io.write("Error #" .. errors .. " — retrying...")
+        io.write("Error #" .. errors .. ": " .. tostring(err or "unknown"))
         os.sleep(1)
         if errors >= 10 then
             print()
-            print("Too many errors. Check server is running.")
-            print("Press any key to retry or Ctrl+T to quit.")
+            print("URL: " .. URL)
+            print("Too many errors. Check server.")
+            print("Press any key to retry.")
             os.pullEvent("key")
             errors = 0
             frameCount = 0
