@@ -2,7 +2,7 @@
 local GITHUB_RAW = "https://raw.githubusercontent.com/ob-105/CC-tweaked-Audio-video-playback./main"
 local SELF_URL   = GITHUB_RAW .. "/player.lua"
 local SELF_PATH  = "player.lua"
-local VERSION    = "33"
+local VERSION    = "34"
 local BASE_URL   = GITHUB_RAW  -- set at startup; may be overridden by tunnel URL
 
 local function selfUpdate()
@@ -258,13 +258,17 @@ local function renderNFPHCD(mon, data, prevState)
     return { top = topLines, bot = botLines }
 end
 
-local function playAudio(speakers, name, stats, audioData, stopped)
+local function playAudio(speakers, name, stats, audioData, stopped, paused, volume)
     local dfpwm   = require("cc.audio.dfpwm")
     local decoder = dfpwm.make_decoder()
     local stalls  = 0
 
     local function processChunks(readFn, closeFn)
         while true do
+            -- Wait while paused
+            while paused and paused.value and not (stopped and stopped.value) do
+                os.sleep(0.05)
+            end
             if stopped and stopped.value then break end
             local t0chunk = os.clock()
             -- Use pcall so a closed/dropped handle is treated as end-of-stream
@@ -278,17 +282,19 @@ local function playAudio(speakers, name, stats, audioData, stopped)
                 print(("\n[warn] Audio fetch slow: %.2fs"):format(fetchTime))
             end
             local pcm  = decoder(chunk)
+            local vol  = (volume and volume.value) or 1.0
             local busy = true
             local underrun = false
             while busy do
                 busy = false
                 for _, spk in ipairs(speakers) do
-                    if not spk.playAudio(pcm) then busy = true end
+                    if not spk.playAudio(pcm, vol) then busy = true end
                 end
                 if busy then
                     underrun = true
                     os.pullEvent("speaker_audio_empty")
                     if stopped and stopped.value then busy = false end
+                    if paused and paused.value then busy = false end
                 end
             end
             if stopped and stopped.value then break end
@@ -608,11 +614,28 @@ local function playMedia(mon, speakers, name, manifest, store)
 
     -- Shared stats table written by both loops
     local stats = { skipped=0, dlSlow=0, dlFailed=0, audioStalls=0, audioFailed=false }
-    -- Shared stop flags: stopped = user pressed Q; done = video finished naturally
-    local stopped = {value = false}
-    local done    = {value = false}
+    -- Shared control state
+    local stopped = {value = false}  -- Q pressed: abort
+    local done    = {value = false}  -- video/audio finished naturally
+    local paused  = {value = false}  -- P pressed: freeze
+    local volume  = {value = 1.0}    -- 0.0-3.0; +/- to adjust
+    local REMOTE_PROTOCOL = "cct-media-ctrl"
     local framePeriod = 1 / fps
     local totalSecs   = count / fps
+
+    -- Open any wireless modems for remote control
+    local remoteOpen = false
+    for _, side in ipairs(peripheral.getNames()) do
+        local m = peripheral.wrap(side)
+        if m and m.isWireless and m.isWireless() then
+            pcall(rednet.open, side)
+            remoteOpen = true
+        end
+    end
+    if remoteOpen then
+        rednet.broadcast({cmd="announce", id=os.getComputerID(), media=name}, REMOTE_PROTOCOL)
+        print(("[remote] Wireless remote active. Player ID: %d"):format(os.getComputerID()))
+    end
 
     -- For network playback, pre-fetch audio from the store into memory so the
     -- audioLoop can play it without any HTTP during playback.
@@ -721,6 +744,15 @@ local function playMedia(mon, speakers, name, manifest, store)
     local function videoLoop()
         for frame = 1, count do
             if stopped.value then break end
+
+            -- Handle pause: freeze frame timing by shifting t0 forward
+            if paused.value then
+                local pauseStart = os.clock()
+                while paused.value and not stopped.value do os.sleep(0.05) end
+                t0 = t0 + (os.clock() - pauseStart)
+            end
+            if stopped.value then break end
+
             renderIdx = frame
             local due     = (frame - 1) * framePeriod
             local elapsed = os.clock() - t0
@@ -742,11 +774,12 @@ local function playMedia(mon, speakers, name, manifest, store)
             -- Live status line (overwrites itself)
             elapsed = os.clock() - t0
             local timeLeft = math.max(0, totalSecs - elapsed)
-            term.write(("\r  Frame %d/%d (%d%%)  %.0fs left  [Q]=Stop  skip=%d fail=%d   "):format(
+            local pauseTag = paused.value and "  ||PAUSED||" or ""
+            term.write(("\r  Frame %d/%d (%d%%)  %.0fs  Vol:%.1f  [P]/[Q]  skip=%d fail=%d%s   "):format(
                 frame, count,
                 math.floor(frame * 100 / count),
-                timeLeft,
-                stats.skipped, stats.dlFailed))
+                timeLeft, volume.value,
+                stats.skipped, stats.dlFailed, pauseTag))
 
             elapsed = os.clock() - t0
             if elapsed <= due + framePeriod then
@@ -758,6 +791,16 @@ local function playMedia(mon, speakers, name, manifest, store)
                     elseif fext == "nfph" then renderNFPH(mon, frameData)
                     elseif fext == "nfpc" then renderNFPC(mon, frameData)
                     else renderNFP(mon, frameData) end
+                    -- Progress bar overlay on the bottom row of the monitor
+                    local mw, mh = mon.getSize()
+                    local barW = mw - 7
+                    local filled = math.max(0, math.floor(barW * frame / count))
+                    local bar = string.rep("=", filled) .. string.rep("-", barW - filled)
+                    local pct = math.floor(frame * 100 / count)
+                    mon.setCursorPos(1, mh)
+                    mon.setBackgroundColor(colors.black)
+                    mon.setTextColor(paused.value and colors.yellow or colors.lime)
+                    mon.write(("[%s]%3d%%"):format(bar, pct):sub(1, mw))
                 end
             else
                 if not stopped.value then stats.skipped = stats.skipped + 1 end
@@ -769,22 +812,47 @@ local function playMedia(mon, speakers, name, manifest, store)
         print()  -- newline after the final status line
     end
     local function audioLoop()
-        if audio and #speakers > 0 then playAudio(speakers, name, stats, audioData, stopped) end
+        if audio and #speakers > 0 then playAudio(speakers, name, stats, audioData, stopped, paused, volume) end
         -- Signal inputLoop to exit (needed for audio-only playback where videoLoop never runs)
         done.value = true
         os.queueEvent("playback_done")
     end
     local function inputLoop()
-        -- Watches for Q key; exits when Q pressed or when video finishes (done flag)
+        local function doStop()
+            stopped.value = true
+            for _, spk in ipairs(speakers) do pcall(function() spk.stop() end) end
+            os.queueEvent("speaker_audio_empty")
+        end
+        local function doTogglePause()
+            paused.value = not paused.value
+            -- Wake audio if it's sleeping on speaker_audio_empty while we unpause
+            if not paused.value then os.queueEvent("speaker_audio_empty") end
+        end
         while true do
             local ev = {os.pullEvent()}
-            if ev[1] == "key" and ev[2] == keys.q then
-                stopped.value = true
-                -- Stop all speakers immediately
-                for _, spk in ipairs(speakers) do pcall(function() spk.stop() end) end
-                -- Wake audioLoop in case it is blocked on speaker_audio_empty
-                os.queueEvent("speaker_audio_empty")
-                return
+            if ev[1] == "key" then
+                local k = ev[2]
+                if k == keys.q then
+                    doStop(); return
+                elseif k == keys.p then
+                    doTogglePause()
+                elseif k == keys.equals then  -- = / + key
+                    volume.value = math.min(3.0, math.floor((volume.value + 0.2) * 10 + 0.5) / 10)
+                elseif k == keys.minus then
+                    volume.value = math.max(0.0, math.floor((volume.value - 0.2) * 10 + 0.5) / 10)
+                end
+            elseif ev[1] == "rednet_message" then
+                local _, msg, protocol = ev[2], ev[3], ev[4]
+                if protocol == REMOTE_PROTOCOL and type(msg) == "table" then
+                    local cmd = msg.cmd
+                    if     cmd == "stop"         then doStop(); return
+                    elseif cmd == "toggle_pause" then doTogglePause()
+                    elseif cmd == "pause"        then paused.value = true
+                    elseif cmd == "resume"       then paused.value = false; os.queueEvent("speaker_audio_empty")
+                    elseif cmd == "vol_up"       then volume.value = math.min(3.0, math.floor((volume.value + 0.2)*10+0.5)/10)
+                    elseif cmd == "vol_down"     then volume.value = math.max(0.0, math.floor((volume.value - 0.2)*10+0.5)/10)
+                    end
+                end
             end
             if done.value then return end
         end
