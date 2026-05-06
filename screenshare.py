@@ -13,6 +13,10 @@ Resolution: 51x38 half-block pixels  →  51 cols x 19 rows on a monitor at scal
 import time
 import threading
 import socket
+import re
+import shutil
+import subprocess
+import atexit
 import numpy as np
 from flask import Flask, Response, jsonify
 from PIL import Image
@@ -149,6 +153,55 @@ def serve_index():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Cloudflare quick tunnel
+# ─────────────────────────────────────────────────────────────────────────────
+
+_cf_proc = None
+
+def start_cloudflared(port: int, url_callback) -> None:
+    """Spawn cloudflared quick tunnel and call url_callback(url) once ready."""
+    global _cf_proc
+    if shutil.which("cloudflared") is None:
+        print("[cloudflared] Not found on PATH — no tunnel started.")
+        print("  Install from: https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/")
+        return
+    try:
+        _cf_proc = subprocess.Popen(
+            ["cloudflared", "tunnel", "--url", f"http://127.0.0.1:{port}"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+    except Exception as e:
+        print(f"[cloudflared] Failed to start: {e}")
+        return
+
+    pat = re.compile(r"https://[a-z0-9\-]+\.trycloudflare\.com")
+    found = threading.Event()
+
+    def _reader():
+        for line in _cf_proc.stdout:
+            line = line.rstrip()
+            if not found.is_set():
+                m = pat.search(line)
+                if m:
+                    found.set()
+                    url_callback(m.group(0))
+    threading.Thread(target=_reader, daemon=True).start()
+
+
+def stop_cloudflared():
+    global _cf_proc
+    if _cf_proc and _cf_proc.poll() is None:
+        _cf_proc.terminate()
+        try:
+            _cf_proc.wait(timeout=3)
+        except Exception:
+            _cf_proc.kill()
+    _cf_proc = None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Entry point
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -183,5 +236,18 @@ if __name__ == "__main__":
     t = threading.Thread(target=capture_loop, daemon=True)
     t.start()
     print("[screenshare] Capture thread started.")
+
+    # Start cloudflared tunnel
+    _tunnel_ready = threading.Event()
+    def _on_tunnel_url(url):
+        print()
+        print("  ► Tunnel URL : " + url)
+        print("  Enter the tunnel URL above in screenshare.lua for remote access.")
+        print()
+        _tunnel_ready.set()
+
+    print("[cloudflared] Starting quick tunnel...")
+    start_cloudflared(PORT, _on_tunnel_url)
+    atexit.register(stop_cloudflared)
 
     app.run(host="0.0.0.0", port=PORT, debug=False, use_reloader=False)
