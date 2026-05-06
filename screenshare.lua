@@ -28,12 +28,17 @@ local mW, mH = mon.getSize()
 -- Get server URL
 -- ─────────────────────────────────────────────────────────────────
 term.clear(); term.setCursorPos(1, 1)
-print("=== CC:T Screen Mirror ===")
+print("=== CC:T Screen Share ===")
 print()
 print("Monitor: " .. mW .. " cols x " .. mH .. " rows")
-print("Pixels:  " .. mW .. " x "      .. (mH*2) .. " (half-block)")
+print("Pixels:  " .. mW .. " x " .. (mH*2) .. " (half-block)")
 print()
-io.write("Server URL: ")
+print("In server.py:")
+print("  1. Server tab -> Start Server")
+print("  2. Screen Share tab -> Start")
+print("  3. Copy the URL shown there")
+print()
+io.write("URL: ")
 local BASE = io.read()
 if not BASE or BASE:match("^%s*$") then
     print("No URL entered."); return
@@ -83,7 +88,7 @@ local frameCount = 0
 local startTime  = os.epoch("utc")
 local lastFPS    = -1
 local errors     = 0
-local URL        = BASE .. "/frame"
+local URL        = BASE .. "/screenshare/frame"
 
 while true do
     local ok, res = pcall(http.get, URL)

@@ -24,7 +24,22 @@ import shutil
 import subprocess
 import sys
 import threading
+import time
 import queue
+
+# Screen share optional deps (numpy + Pillow are likely already installed via convert.py)
+try:
+    import numpy as _np
+    from PIL import Image as _PILImage
+    _HAVE_NUMPY = True
+except ImportError:
+    _HAVE_NUMPY = False
+
+try:
+    import mss as _mss_mod
+    _HAVE_MSS = True
+except ImportError:
+    _HAVE_MSS = False
 
 # ---------------------------------------------------------------------------
 # Import all conversion logic from convert.py (same directory)
@@ -81,6 +96,22 @@ def _make_flask_app(base_dir):
             lines.append(f'<li>{a}</li>')
         lines.append("</ul>")
         return "\n".join(lines)
+
+    @app.route("/screenshare/frame")
+    def serve_ss_frame():
+        with _ss_lock:
+            data = _ss_frame
+        if not data:
+            from flask import abort
+            abort(503)
+        from flask import Response as _Resp
+        return _Resp(data, mimetype="text/plain; charset=ascii")
+
+    @app.route("/screenshare/info")
+    def serve_ss_info():
+        from flask import jsonify as _json
+        return _json({"w": _ss_w, "h": _ss_h, "fps": round(_ss_fps, 1),
+                      "running": _ss_running})
 
     return app
 
@@ -168,6 +199,104 @@ def stop_cloudflared():
         except Exception:
             _cf_proc.kill()
     _cf_proc = None
+
+
+# ---------------------------------------------------------------------------
+# Screen share — capture & encode
+# ---------------------------------------------------------------------------
+
+# CC:Tweaked 16-color palette (index = blit hex digit 0-f)
+_SS_PALETTE = None
+
+def _init_ss_palette():
+    global _SS_PALETTE
+    if _SS_PALETTE is None and _HAVE_NUMPY:
+        _SS_PALETTE = _np.array([
+            (240,240,240),(242,178, 51),(229,127,216),(153,178,242),
+            (222,222,108),(127,204, 25),(242,178,204),( 76, 76, 76),
+            (153,153,153),( 76,153,178),(178,102,229),( 51,102,204),
+            (127,102, 76),( 87,166, 78),(204, 76, 76),( 17, 17, 17),
+        ], dtype=_np.int32)
+        global _SS_HEX
+        _SS_HEX = _np.frombuffer(b"0123456789abcdef", dtype=_np.uint8)
+
+_SS_HEX = None
+
+_ss_lock    = threading.Lock()
+_ss_frame   = b""
+_ss_fps     = 0.0
+_ss_running = False
+_ss_thread  = None
+_ss_w       = 51
+_ss_h       = 38   # half-block rows = monitor_rows * 2
+
+
+def _ss_grab():
+    if _HAVE_MSS:
+        with _mss_mod.mss() as sct:
+            raw = sct.grab(sct.monitors[1])
+            return _PILImage.frombytes("RGB", raw.size, raw.bgra, "raw", "BGRX")
+    else:
+        from PIL import ImageGrab
+        return ImageGrab.grab()
+
+
+def _ss_encode(img, w, h):
+    try:
+        resample = _PILImage.Resampling.LANCZOS
+    except AttributeError:
+        resample = _PILImage.LANCZOS
+    img   = img.resize((w, h), resample)
+    arr   = _np.array(img, dtype=_np.int32)
+    flat  = arr.reshape(-1, 3)
+    diffs = flat[:, None, :] - _SS_PALETTE[None, :, :]
+    dists = (diffs * diffs).sum(axis=2)
+    idx   = dists.argmin(axis=1).reshape(h, w).astype(_np.uint8)
+    chars = _SS_HEX[idx]
+    rows  = _np.hstack([chars, _np.full((h, 1), ord('\n'), dtype=_np.uint8)])
+    return bytes(rows.ravel())
+
+
+def _ss_loop():
+    global _ss_frame, _ss_fps
+    _init_ss_palette()
+    durations = []
+    while _ss_running:
+        t0 = time.perf_counter()
+        try:
+            frame = _ss_encode(_ss_grab(), _ss_w, _ss_h)
+            with _ss_lock:
+                _ss_frame = frame
+        except Exception:
+            time.sleep(0.5)
+            continue
+        dt = time.perf_counter() - t0
+        durations.append(dt)
+        if len(durations) > 30:
+            durations.pop(0)
+        _ss_fps = 1.0 / (sum(durations) / len(durations)) if durations else 0.0
+
+
+def start_screenshare(w, h, log_fn):
+    global _ss_running, _ss_thread, _ss_w, _ss_h
+    if _ss_running:
+        return
+    if not _HAVE_NUMPY:
+        log_fn("[screenshare] numpy/Pillow not installed.")
+        return
+    _ss_w, _ss_h = w, h
+    _ss_running = True
+    _ss_thread = threading.Thread(target=_ss_loop, daemon=True)
+    _ss_thread.start()
+    log_fn(f"[screenshare] Capture started — {w}×{h} half-block pixels.")
+
+
+def stop_screenshare(log_fn=None):
+    global _ss_running, _ss_frame
+    _ss_running = False
+    _ss_frame = b""
+    if log_fn:
+        log_fn("[screenshare] Capture stopped.")
 
 
 # ---------------------------------------------------------------------------
@@ -476,7 +605,142 @@ def launch_gui():
     stop_btn = ttk.Button(btn_frame, text="■  Stop Server", width=18, command=stop_server, state="disabled")
     stop_btn.pack(side="left", padx=6)
 
+    # =========================================================
+    # TAB 3 — SCREEN SHARE
+    # =========================================================
+    tab_ss = ttk.Frame(notebook)
+    notebook.add(tab_ss, text="  Screen Share  ")
+
+    ss_res_f = ttk.LabelFrame(tab_ss, text="Resolution", padding=10)
+    ss_res_f.pack(fill="x", padx=12, pady=(12, 4))
+
+    ttk.Label(ss_res_f, text="Monitors wide:").grid(row=0, column=0, sticky="w", pady=2)
+    ss_mx = tk.IntVar(value=1)
+    ttk.Spinbox(ss_res_f, from_=1, to=8, textvariable=ss_mx, width=5).grid(row=0, column=1, padx=(6,16))
+
+    ttk.Label(ss_res_f, text="Monitors tall:").grid(row=0, column=2, sticky="w", pady=2)
+    ss_my = tk.IntVar(value=1)
+    ttk.Spinbox(ss_res_f, from_=1, to=8, textvariable=ss_my, width=5).grid(row=0, column=3, padx=(6,0))
+
+    ss_res_lbl = ttk.Label(ss_res_f, foreground="#555")
+    ss_res_lbl.grid(row=1, column=0, columnspan=4, sticky="w", pady=(4,0))
+
+    def _ss_update_res(*_):
+        w = ss_mx.get() * 51
+        h = ss_my.get() * 38   # 19 char rows × 2 half-block rows per char
+        ss_res_lbl.configure(text=f"→ {w} × {h} half-block pixels  "
+                                   f"({ss_mx.get()*51} cols × {ss_my.get()*19} char rows on monitor)")
+    ss_mx.trace_add("write", _ss_update_res)
+    ss_my.trace_add("write", _ss_update_res)
+    _ss_update_res()
+
+    backend_txt = ("Backend: mss  (fast)" if _HAVE_MSS
+                   else "Backend: PIL.ImageGrab  (slower — pip install mss to speed up)")
+    numpy_txt   = ("numpy/Pillow: available ✓" if _HAVE_NUMPY
+                   else "numpy/Pillow: NOT found — pip install numpy Pillow")
+    ttk.Label(ss_res_f, text=backend_txt, foreground="#555").grid(
+        row=2, column=0, columnspan=4, sticky="w", pady=(2,0))
+    ttk.Label(ss_res_f, text=numpy_txt,   foreground="#555" if _HAVE_NUMPY else "#c00").grid(
+        row=3, column=0, columnspan=4, sticky="w")
+
+    ss_ctrl_f = ttk.LabelFrame(tab_ss, text="Capture Control", padding=10)
+    ss_ctrl_f.pack(fill="x", padx=12, pady=4)
+
+    ss_status_var = tk.StringVar(value="Stopped")
+    ss_status_lbl = ttk.Label(ss_ctrl_f, textvariable=ss_status_var,
+                               foreground="#c00", font=("", 10, "bold"))
+    ss_status_lbl.grid(row=0, column=0, columnspan=3, sticky="w", pady=(0,6))
+
+    ss_fps_var = tk.StringVar(value="")
+    ttk.Label(ss_ctrl_f, textvariable=ss_fps_var, foreground="#555").grid(
+        row=1, column=0, columnspan=3, sticky="w", pady=(0,6))
+
+    def _ss_poll_fps():
+        if _ss_running:
+            ss_fps_var.set(f"Capture FPS: {_ss_fps:.1f}")
+        root.after(500, _ss_poll_fps)
+    root.after(500, _ss_poll_fps)
+
+    ss_log_q = queue.Queue()
+
+    def _ss_log(msg):
+        ss_log_q.put(msg)
+
+    def _ss_start():
+        w = ss_mx.get() * 51
+        h = ss_my.get() * 38
+        start_screenshare(w, h, _ss_log)
+        ss_status_var.set("Capturing ✓")
+        ss_status_lbl.configure(foreground="#060")
+        ss_start_btn.configure(state="disabled")
+        ss_stop_btn.configure(state="normal")
+
+    def _ss_stop():
+        stop_screenshare(_ss_log)
+        ss_status_var.set("Stopped")
+        ss_fps_var.set("")
+        ss_status_lbl.configure(foreground="#c00")
+        ss_start_btn.configure(state="normal")
+        ss_stop_btn.configure(state="disabled")
+
+    ss_btn_row = ttk.Frame(ss_ctrl_f)
+    ss_btn_row.grid(row=2, column=0, columnspan=3, sticky="w")
+    ss_start_btn = ttk.Button(ss_btn_row, text="▶  Start Capture", width=18, command=_ss_start)
+    ss_start_btn.pack(side="left", padx=(0,6))
+    ss_stop_btn  = ttk.Button(ss_btn_row, text="■  Stop Capture",  width=18, command=_ss_stop,
+                               state="disabled")
+    ss_stop_btn.pack(side="left")
+
+    ss_url_f = ttk.LabelFrame(tab_ss, text="In-game URL", padding=10)
+    ss_url_f.pack(fill="x", padx=12, pady=4)
+
+    ttk.Label(ss_url_f,
+              text="Start the Server tab first, then use its Tunnel URL in screenshare.lua.\n"
+                   "The Lua script will fetch:  <tunnel_url>/screenshare/frame",
+              foreground="#555").pack(anchor="w")
+
+    ss_hint_var = tk.StringVar(value="(start Server tab to see URL)")
+    ss_hint_entry = ttk.Entry(ss_url_f, textvariable=ss_hint_var, width=58, state="readonly")
+    ss_hint_entry.pack(pady=(6,0), fill="x")
+
+    def _ss_copy_url():
+        u = ss_hint_var.get()
+        if u and not u.startswith("("):
+            root.clipboard_clear(); root.clipboard_append(u)
+            ss_copy_btn.configure(text="Copied!")
+            root.after(1500, lambda: ss_copy_btn.configure(text="Copy URL"))
+
+    ss_copy_btn = ttk.Button(ss_url_f, text="Copy URL", command=_ss_copy_url)
+    ss_copy_btn.pack(pady=(4,0), anchor="w")
+
+    # Keep hint URL in sync with Server tab tunnel URL
+    def _ss_sync_url(*_):
+        u = url_var.get()
+        if u:
+            ss_hint_var.set(u + "/screenshare/frame")
+        else:
+            ss_hint_var.set("(start Server tab to see URL)")
+    url_var.trace_add("write", _ss_sync_url)
+
+    # Screen share log
+    ss_log_f = ttk.LabelFrame(tab_ss, text="Log", padding=10)
+    ss_log_f.pack(fill="both", expand=True, padx=12, pady=(4,8))
+    ss_log_txt = scrolledtext.ScrolledText(ss_log_f, height=6, width=74,
+                                            state="disabled", font=("Consolas", 9))
+    ss_log_txt.pack()
+
+    def _poll_ss_log():
+        while not ss_log_q.empty():
+            m = ss_log_q.get_nowait()
+            ss_log_txt.configure(state="normal")
+            ss_log_txt.insert(tk.END, m + "\n")
+            ss_log_txt.see(tk.END)
+            ss_log_txt.configure(state="disabled")
+        root.after(150, _poll_ss_log)
+    root.after(150, _poll_ss_log)
+
     def on_close():
+        stop_screenshare()
         stop_cloudflared()
         root.destroy()
 
