@@ -2,7 +2,7 @@
 local GITHUB_RAW = "https://raw.githubusercontent.com/ob-105/CC-tweaked-Audio-video-playback./main"
 local SELF_URL   = GITHUB_RAW .. "/player.lua"
 local SELF_PATH  = "player.lua"
-local VERSION    = "29"
+local VERSION    = "30"
 local BASE_URL   = GITHUB_RAW  -- set at startup; may be overridden by tunnel URL
 
 local function selfUpdate()
@@ -258,13 +258,14 @@ local function renderNFPHCD(mon, data, prevState)
     return { top = topLines, bot = botLines }
 end
 
-local function playAudio(speakers, name, stats, audioData)
+local function playAudio(speakers, name, stats, audioData, stopped)
     local dfpwm   = require("cc.audio.dfpwm")
     local decoder = dfpwm.make_decoder()
     local stalls  = 0
 
     local function processChunks(readFn, closeFn)
         while true do
+            if stopped and stopped.value then break end
             local t0chunk = os.clock()
             local chunk = readFn()
             if not chunk then break end
@@ -285,8 +286,10 @@ local function playAudio(speakers, name, stats, audioData)
                 if busy then
                     underrun = true
                     os.pullEvent("speaker_audio_empty")
+                    if stopped and stopped.value then busy = false end
                 end
             end
+            if stopped and stopped.value then break end
             if underrun then
                 stalls = stalls + 1
                 if stats then stats.audioStalls = (stats.audioStalls or 0) + 1 end
@@ -588,6 +591,9 @@ local function playMedia(mon, speakers, name, manifest, store)
 
     -- Shared stats table written by both loops
     local stats = { skipped=0, dlSlow=0, dlFailed=0, audioStalls=0, audioFailed=false }
+    -- Shared stop flags: stopped = user pressed Q; done = video finished naturally
+    local stopped = {value = false}
+    local done    = {value = false}
     local framePeriod = 1 / fps
     local totalSecs   = count / fps
 
@@ -621,7 +627,12 @@ local function playMedia(mon, speakers, name, manifest, store)
         if store then
             -- Sequential store.get() for storage-network playback
             for i = 1, count do
-                while i > renderIdx + NET_AHEAD do os.sleep(0) end
+                if stopped.value then break end
+                while i > renderIdx + NET_AHEAD do
+                    if stopped.value then break end
+                    os.sleep(0)
+                end
+                if stopped.value then break end
                 if prefetchBuf[i] == nil then
                     local key  = ("media/%s/frames/%06d"):format(name, i)
                     local data = store.get(key)
@@ -636,11 +647,12 @@ local function playMedia(mon, speakers, name, manifest, store)
             local function flightCount()
                 local n = 0; for _ in pairs(inFlight) do n = n + 1 end; return n
             end
-            while nextFetch <= count or next(inFlight) ~= nil do
+            while (nextFetch <= count or next(inFlight) ~= nil) and not stopped.value do
                 -- Fire off HTTP requests or read disk up to limits
                 while nextFetch <= count
                       and nextFetch <= renderIdx + NET_AHEAD
-                      and flightCount() < HTTP_PAR do
+                      and flightCount() < HTTP_PAR
+                      and not stopped.value do
                     local p = framePath(nextFetch)
                     if fs.exists(p) then
                         -- Pre-downloaded: read directly into buffer, no HTTP needed
@@ -676,7 +688,7 @@ local function playMedia(mon, speakers, name, manifest, store)
                             inFlight[url] = nil
                         end
                     end
-                    -- Other events (timer, speaker_audio_empty, etc.) are broadcast
+                    -- Other events (timer, speaker_audio_empty, key, etc.) are broadcast
                     -- to all coroutines by parallel.waitForAll — no action needed here
                 elseif nextFetch > count then
                     break   -- all frames dispatched, no in-flight requests
@@ -689,6 +701,7 @@ local function playMedia(mon, speakers, name, manifest, store)
 
     local function videoLoop()
         for frame = 1, count do
+            if stopped.value then break end
             renderIdx = frame
             local due     = (frame - 1) * framePeriod
             local elapsed = os.clock() - t0
@@ -696,7 +709,7 @@ local function playMedia(mon, speakers, name, manifest, store)
 
             -- Wait for prefetcher to deliver this frame (works for both store and HTTP paths)
             local giveUp = os.clock() + framePeriod * 2
-            while prefetchBuf[frame] == nil and os.clock() < giveUp do
+            while prefetchBuf[frame] == nil and os.clock() < giveUp and not stopped.value do
                 os.sleep(0)
             end
             local fd = prefetchBuf[frame]
@@ -704,23 +717,23 @@ local function playMedia(mon, speakers, name, manifest, store)
             if fd then
                 frameData = fd
             else
-                stats.dlFailed = stats.dlFailed + 1
+                if not stopped.value then stats.dlFailed = stats.dlFailed + 1 end
             end
 
             -- Live status line (overwrites itself)
             elapsed = os.clock() - t0
             local timeLeft = math.max(0, totalSecs - elapsed)
-            term.write(("\r  Frame %d/%d (%d%%)  %.0fs left  skip=%d  slow=%d  fail=%d   "):format(
+            term.write(("\r  Frame %d/%d (%d%%)  %.0fs left  [Q]=Stop  skip=%d fail=%d   "):format(
                 frame, count,
                 math.floor(frame * 100 / count),
                 timeLeft,
-                stats.skipped, stats.dlSlow, stats.dlFailed))
+                stats.skipped, stats.dlFailed))
 
             elapsed = os.clock() - t0
             if elapsed <= due + framePeriod then
                 local wait = due - elapsed
                 if wait > 0 then os.sleep(wait) end
-                if frameData and video then
+                if frameData and video and not stopped.value then
                     if fext == "nfphcd" then prevHalfState = renderNFPHCD(mon, frameData, prevHalfState)
                     elseif fext == "nfphc" then renderNFPHC(mon, frameData)
                     elseif fext == "nfph" then renderNFPH(mon, frameData)
@@ -728,26 +741,48 @@ local function playMedia(mon, speakers, name, manifest, store)
                     else renderNFP(mon, frameData) end
                 end
             else
-                stats.skipped = stats.skipped + 1
+                if not stopped.value then stats.skipped = stats.skipped + 1 end
             end
         end
+        -- Signal inputLoop that video is done so it can exit cleanly
+        done.value = true
+        os.queueEvent("playback_done")
         print()  -- newline after the final status line
     end
     local function audioLoop()
-        if audio and #speakers > 0 then playAudio(speakers, name, stats, audioData) end
+        if audio and #speakers > 0 then playAudio(speakers, name, stats, audioData, stopped) end
     end
-    -- Always include prefetchLoop in parallel (it exits immediately if store==nil)
-    if audio and video and count > 0 then parallel.waitForAll(audioLoop, videoLoop, prefetchLoop)
-    elseif audio then audioLoop()
-    elseif count > 0 then parallel.waitForAll(videoLoop, prefetchLoop) end
+    local function inputLoop()
+        -- Watches for Q key; exits when Q pressed or when video finishes (done flag)
+        while true do
+            local ev = {os.pullEvent()}
+            if ev[1] == "key" and ev[2] == keys.q then
+                stopped.value = true
+                -- Stop all speakers immediately
+                for _, spk in ipairs(speakers) do pcall(function() spk.stop() end) end
+                -- Wake audioLoop in case it is blocked on speaker_audio_empty
+                os.queueEvent("speaker_audio_empty")
+                return
+            end
+            if done.value then return end
+        end
+    end
+    -- Always run inputLoop in parallel so Q-to-stop works for all playback modes
+    if audio and video and count > 0 then parallel.waitForAll(audioLoop, videoLoop, prefetchLoop, inputLoop)
+    elseif audio then parallel.waitForAll(audioLoop, inputLoop)
+    elseif count > 0 then parallel.waitForAll(videoLoop, prefetchLoop, inputLoop) end
 
     -- Playback summary
-    print("[player] Playback complete.")
-    if stats.skipped   > 0 then print(("  Skipped frames : %d"):format(stats.skipped)) end
-    if stats.dlSlow    > 0 then print(("  Slow downloads : %d"):format(stats.dlSlow)) end
-    if stats.dlFailed  > 0 then print(("  Failed downloads: %d"):format(stats.dlFailed)) end
-    if stats.audioStalls > 0 then print(("  Audio stalls   : %d"):format(stats.audioStalls)) end
-    if stats.audioFailed   then print("  Audio          : FAILED to fetch") end
+    if stopped.value then
+        print("[player] Stopped.")
+    else
+        print("[player] Playback complete.")
+        if stats.skipped   > 0 then print(("  Skipped frames : %d"):format(stats.skipped)) end
+        if stats.dlSlow    > 0 then print(("  Slow downloads : %d"):format(stats.dlSlow)) end
+        if stats.dlFailed  > 0 then print(("  Failed downloads: %d"):format(stats.dlFailed)) end
+        if stats.audioStalls > 0 then print(("  Audio stalls   : %d"):format(stats.audioStalls)) end
+        if stats.audioFailed   then print("  Audio          : FAILED to fetch") end
+    end
     -- Clean up any leftover buffered frames (downloaded but not yet rendered)
     local mediaDir = "media/"..name
     if fs.exists(mediaDir) then fs.delete(mediaDir) end
