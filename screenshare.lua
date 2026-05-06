@@ -7,7 +7,7 @@
 local HALF = "\x8f"  -- ▄ half-block character
 
 -- ─────────────────────────────────────────────────────────────────
--- Find a monitor
+-- Find a monitor (fall back to built-in terminal screen)
 -- ─────────────────────────────────────────────────────────────────
 local mon = nil
 for _, name in ipairs(peripheral.getNames()) do
@@ -15,13 +15,15 @@ for _, name in ipairs(peripheral.getNames()) do
         mon = peripheral.wrap(name); break
     end
 end
-if not mon then
-    print("No monitor found!")
-    print("Attach a monitor and re-run.")
-    return
+
+local usingTerminal = false
+if mon then
+    mon.setTextScale(0.5)
+else
+    mon = term
+    usingTerminal = true
 end
 
-mon.setTextScale(0.5)
 local mW, mH = mon.getSize()
 
 -- ─────────────────────────────────────────────────────────────────
@@ -30,7 +32,8 @@ local mW, mH = mon.getSize()
 term.clear(); term.setCursorPos(1, 1)
 print("=== CC:T Screen Share ===")
 print()
-print("Monitor: " .. mW .. " cols x " .. mH .. " rows")
+print("Display: " .. (usingTerminal and "built-in terminal" or "monitor"))
+print("Size:    " .. mW .. " cols x " .. mH .. " rows")
 print("Pixels:  " .. mW .. " x " .. (mH*2) .. " (half-block)")
 print()
 print("In server.py:")
@@ -101,14 +104,17 @@ while true do
             renderFrame(data)
             frameCount = frameCount + 1
 
-            -- Update FPS on terminal (don't spam every frame)
-            local elapsed = (os.epoch("utc") - startTime) / 1000.0
-            if elapsed > 0 then
-                local fps = frameCount / elapsed
-                if math.abs(fps - lastFPS) >= 0.2 then
-                    lastFPS = fps
-                    term.setCursorPos(1, 1); term.clearLine()
-                    io.write(("FPS: %.1f  Frames: %d"):format(fps, frameCount))
+            -- Only show FPS counter when using a separate monitor;
+            -- on the built-in screen it would overwrite the image.
+            if not usingTerminal then
+                local elapsed = (os.epoch("utc") - startTime) / 1000.0
+                if elapsed > 0 then
+                    local fps = frameCount / elapsed
+                    if math.abs(fps - lastFPS) >= 0.2 then
+                        lastFPS = fps
+                        term.setCursorPos(1, 1); term.clearLine()
+                        io.write(("FPS: %.1f  Frames: %d"):format(fps, frameCount))
+                    end
                 end
             end
         end
