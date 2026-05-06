@@ -2,7 +2,7 @@
 local GITHUB_RAW = "https://raw.githubusercontent.com/ob-105/CC-tweaked-Audio-video-playback./main"
 local SELF_URL   = GITHUB_RAW .. "/player.lua"
 local SELF_PATH  = "player.lua"
-local VERSION    = "30"
+local VERSION    = "31"
 local BASE_URL   = GITHUB_RAW  -- set at startup; may be overridden by tunnel URL
 
 local function selfUpdate()
@@ -267,8 +267,10 @@ local function playAudio(speakers, name, stats, audioData, stopped)
         while true do
             if stopped and stopped.value then break end
             local t0chunk = os.clock()
-            local chunk = readFn()
-            if not chunk then break end
+            -- Use pcall so a closed/dropped handle is treated as end-of-stream
+            -- rather than crashing with "attempt to use a closed file"
+            local ok, chunk = pcall(readFn)
+            if not ok or not chunk then break end
             local fetchTime = os.clock() - t0chunk
             if fetchTime > 0.5 then
                 stalls = stalls + 1
@@ -751,6 +753,9 @@ local function playMedia(mon, speakers, name, manifest, store)
     end
     local function audioLoop()
         if audio and #speakers > 0 then playAudio(speakers, name, stats, audioData, stopped) end
+        -- Signal inputLoop to exit (needed for audio-only playback where videoLoop never runs)
+        done.value = true
+        os.queueEvent("playback_done")
     end
     local function inputLoop()
         -- Watches for Q key; exits when Q pressed or when video finishes (done flag)
