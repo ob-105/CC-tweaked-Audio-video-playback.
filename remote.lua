@@ -11,8 +11,39 @@
 --
 -- Controls depend on current screen — options are always printed on-screen.
 
+local GITHUB_RAW      = "https://raw.githubusercontent.com/ob-105/CC-tweaked-Audio-video-playback./main"
+local SELF_URL        = GITHUB_RAW .. "/remote.lua"
+local SELF_PATH       = "remote.lua"
+local VERSION         = "36"
 local REMOTE_PROTOCOL = "cct-media-ctrl"
 local POLL_INTERVAL   = 3  -- seconds between automatic status refreshes
+
+-- ────────────────────────────────────────────────────────────────────────────
+-- Self-update
+-- ────────────────────────────────────────────────────────────────────────────
+local function selfUpdate()
+    term.clear(); term.setCursorPos(1,1)
+    print("Checking for updates...")
+    local ok, newData = pcall(function()
+        local r = http.get(SELF_URL)
+        if not r then error("HTTP failed") end
+        local d = r.readAll(); r.close(); return d
+    end)
+    if not ok or not newData then
+        print("Offline, using local copy.")
+        os.sleep(0.8); return
+    end
+    local remoteVer = newData:match('local VERSION%s*=%s*"(%d+)"')
+    if not remoteVer then
+        print("Bad remote version."); os.sleep(0.8); return
+    end
+    if tonumber(remoteVer) <= tonumber(VERSION) then
+        print("Up to date (v"..VERSION..")."); os.sleep(0.5); return
+    end
+    print("Updating to v"..remoteVer.."...")
+    local f = fs.open(SELF_PATH, "w"); f.write(newData); f.close()
+    print("Done! Rebooting..."); os.sleep(0.8); os.reboot()
+end
 
 -- ────────────────────────────────────────────────────────────────────────────
 -- Open wireless modem
@@ -320,6 +351,7 @@ end
 -- ────────────────────────────────────────────────────────────────────────────
 -- Entry point
 -- ────────────────────────────────────────────────────────────────────────────
+selfUpdate()
 local playerID = connect()
 if playerID then
     -- Broadcast our presence so player knows a remote is connected
