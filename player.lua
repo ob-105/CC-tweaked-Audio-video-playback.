@@ -2,7 +2,7 @@
 local GITHUB_RAW = "https://raw.githubusercontent.com/ob-105/CC-tweaked-Audio-video-playback./main"
 local SELF_URL   = GITHUB_RAW .. "/player.lua"
 local SELF_PATH  = "player.lua"
-local VERSION    = "32"
+local VERSION    = "33"
 local BASE_URL   = GITHUB_RAW  -- set at startup; may be overridden by tunnel URL
 
 local function selfUpdate()
@@ -319,13 +319,28 @@ local function playAudio(speakers, name, stats, audioData, stopped)
         processChunks(function() return fh.read(16384) end, function() fh.close() end)
     else
         local url = BASE_URL .. "/output/" .. name .. "/audio.dfpwm"
-        print(("[player] Streaming audio on %d speaker(s)..."):format(#speakers))
+        print(("[player] Downloading audio on %d speaker(s)..."):format(#speakers))
         local res = http.get(url, nil, true)
         if not res then
             print("[player] Audio fetch FAILED.")
             if stats then stats.audioFailed = true end; return
         end
-        processChunks(function() return res.read(16384) end, function() res.close() end)
+        -- Read entire file into memory immediately so the handle can be closed
+        -- before prefetchLoop has any chance to interact with it.
+        local allData = res.readAll()
+        pcall(function() res.close() end)
+        if not allData or #allData == 0 then
+            print("[player] Audio data empty.")
+            if stats then stats.audioFailed = true end; return
+        end
+        print(("[player] Audio buffered (%d KB)."):format(math.ceil(#allData / 1024)))
+        local pos = 1
+        processChunks(function()
+            if pos > #allData then return nil end
+            local chunk = allData:sub(pos, pos + 16383)
+            pos = pos + 16384
+            return chunk
+        end, nil)
     end
 
     if stats then stats.audioStalls = stalls end
@@ -681,7 +696,9 @@ local function playMedia(mon, speakers, name, manifest, store)
                             prefetchBuf[idx] = resp.readAll()
                             resp.close()
                             inFlight[url] = nil
-                        elseif resp then resp.close() end
+                        end
+                        -- If url not in inFlight (e.g. audio response) leave it alone;
+                        -- closing it here would corrupt the audio coroutine's handle.
                     elseif evType == "http_failure" then
                         local url = ev[2]
                         local idx = inFlight[url]
