@@ -2,7 +2,8 @@
 local GITHUB_RAW = "https://raw.githubusercontent.com/ob-105/CC-tweaked-Audio-video-playback./main"
 local SELF_URL   = GITHUB_RAW .. "/player.lua"
 local SELF_PATH  = "player.lua"
-local VERSION    = "27"
+local VERSION    = "28"
+local BASE_URL   = GITHUB_RAW  -- set at startup; may be overridden by tunnel URL
 
 local function selfUpdate()
     print("[player] Checking for updates...")
@@ -31,7 +32,7 @@ local function download(url, path)
 end
 
 local function loadIndex()
-    local url  = GITHUB_RAW .. "/output/index.lua"
+    local url  = BASE_URL .. "/output/index.lua"
     local path = "media/index.lua"
     if fs.exists(path) then fs.delete(path) end
     local res = http.get(url)
@@ -50,7 +51,7 @@ local function loadIndex()
 end
 
 local function loadManifest(name)
-    local url  = GITHUB_RAW .. "/output/" .. name .. "/manifest.lua"
+    local url  = BASE_URL .. "/output/" .. name .. "/manifest.lua"
     local path = "media/" .. name .. "/manifest.lua"
     if fs.exists(path) then fs.delete(path) end
     if not download(url, path) then error("Could not download manifest") end
@@ -312,7 +313,7 @@ local function playAudio(speakers, name, stats, audioData)
         end
         processChunks(function() return fh.read(16384) end, function() fh.close() end)
     else
-        local url = GITHUB_RAW .. "/output/" .. name .. "/audio.dfpwm"
+        local url = BASE_URL .. "/output/" .. name .. "/audio.dfpwm"
         print(("[player] Streaming audio on %d speaker(s)..."):format(#speakers))
         local res = http.get(url, nil, true)
         if not res then
@@ -415,7 +416,7 @@ local function uploadToNetwork(name, manifest, store)
             print("  Audio: already in network.")
         else
             io.write("  Fetching audio from GitHub... ")
-            local res = http.get(GITHUB_RAW .. "/output/" .. name .. "/audio.dfpwm", nil, true)
+            local res = http.get(BASE_URL .. "/output/" .. name .. "/audio.dfpwm", nil, true)
             if not res then
                 print("FAILED")
             else
@@ -434,7 +435,7 @@ local function uploadToNetwork(name, manifest, store)
         for i = 1, count do
             local frameKey = ("media/%s/frames/%06d"):format(name, i)
             if not store.exists(frameKey) then
-                local url = ("%s/output/%s/frames/%06d.%s"):format(GITHUB_RAW, name, i, fext)
+                local url = ("%s/output/%s/frames/%06d.%s"):format(BASE_URL, name, i, fext)
                 local res = http.get(url)
                 if not res then
                     failed = failed + 1
@@ -489,7 +490,7 @@ local function preDownload(name, manifest)
             print("  Audio: already cached.")
         else
             io.write("  Downloading audio... ")
-            local ok = download(GITHUB_RAW .. "/output/" .. name .. "/audio.dfpwm", ap)
+            local ok = download(BASE_URL .. "/output/" .. name .. "/audio.dfpwm", ap)
             print(ok and "OK" or "FAILED")
         end
     end
@@ -499,7 +500,7 @@ local function preDownload(name, manifest)
         local failed = 0
         for i = 1, count do
             local p   = ("media/%s/frames/%06d.%s"):format(name, i, fext)
-            local url = ("%s/output/%s/frames/%06d.%s"):format(GITHUB_RAW, name, i, fext)
+            local url = ("%s/output/%s/frames/%06d.%s"):format(BASE_URL, name, i, fext)
             if not fs.exists(p) then
                 if not download(url, p) then failed = failed + 1 end
             end
@@ -582,7 +583,7 @@ local function playMedia(mon, speakers, name, manifest, store)
         return ("media/%s/frames/%06d.%s"):format(name, i, fext)
     end
     local function frameURL(i)
-        return ("%s/output/%s/frames/%06d.%s"):format(GITHUB_RAW, name, i, fext)
+        return ("%s/output/%s/frames/%06d.%s"):format(BASE_URL, name, i, fext)
     end
 
     -- Shared stats table written by both loops
@@ -774,6 +775,22 @@ local function main()
     term.clear(); term.setCursorPos(1,1)
     print("=== CC:Tweaked Media Player ==="); print()
     selfUpdate()
+    -- Prompt for server URL (Cloudflare tunnel or leave blank for GitHub)
+    print("[player] Enter server URL (blank = use GitHub):")
+    io.write("URL: ")
+    local _inp = io.read()
+    if _inp and _inp:match("^https?://") then
+        BASE_URL = _inp:gsub("/$", "")
+        io.write("[player] Testing connection... ")
+        local _ok, _err = pcall(function()
+            local _r = http.get(BASE_URL .. "/output/index.lua")
+            if _r then _r.close() else error("fail") end
+        end)
+        if _ok then print("OK")
+        else print("FAILED — falling back to GitHub."); BASE_URL = GITHUB_RAW end
+    else
+        print("[player] Using GitHub.")
+    end
     -- Wipe cached media to free disk space before each session
     if fs.exists("media") then
         print("[player] Clearing media cache...")
