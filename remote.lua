@@ -55,10 +55,12 @@ local function ask(playerID, t, timeout)
 end
 
 local function clr() term.clear(); term.setCursorPos(1,1) end
+local SEP  = "--------------------------"
+local SEP2 = "=========================="
 local function header(title)
-    print("================================")
-    print("  CC:T Remote | "..title)
-    print("================================")
+    print(SEP2)
+    print(" "..title)
+    print(SEP2)
 end
 
 -- Read one char, optionally with a timeout (returns nil on timeout)
@@ -78,10 +80,10 @@ end
 -- Connect to player
 -- ────────────────────────────────────────────────────────────────────────────
 local function connect()
-    clr(); header("Connect")
+    clr(); header("CC:T Remote - Connect")
     print()
-    print("Listening for player broadcast...")
-    print("Press any key to enter ID manually.")
+    print("Scanning for player...")
+    print("(press any key to type ID)")
     print()
     local timer = os.startTimer(15)
     while true do
@@ -97,16 +99,16 @@ local function connect()
             end
         elseif ev[1] == "key" or ev[1] == "char" then
             clr(); header("Connect")
-            io.write("Player computer ID: ")
+            io.write("Player ID: ")
             local s = io.read()
             local n = tonumber(s)
             if n then return n end
-            print("Invalid. Try again."); os.sleep(1)
+            print("Invalid."); os.sleep(1)
             return connect()
         elseif ev[1] == "timer" and ev[2] == timer then
             clr(); header("Connect")
-            print("No broadcast received.")
-            io.write("Player computer ID (blank=rescan): ")
+            print("No broadcast found.")
+            io.write("Player ID (blank=rescan): ")
             local s = io.read()
             local n = tonumber(s)
             if n then return n end
@@ -141,15 +143,16 @@ end
 -- Status bar (drawn at top of every main screen)
 -- ────────────────────────────────────────────────────────────────────────────
 local function statusBar(status)
-    local st  = status.state or "?"
-    local med = (status.media or "-"):sub(1,18)
-    local icon = st=="playing" and "\16" or st=="paused" and "||" or st=="menu" and "MENU" or "?"
+    local st   = status.state or "?"
+    local med  = (status.media or "-"):sub(1, 14)
+    local icon = st=="playing" and "\16" or st=="paused" and "||" or "--"
     local pct  = 0
     if (status.count or 0) > 0 then
         pct = math.floor((status.frame or 0) * 100 / status.count)
     end
-    print(("  %s  %s  %d%%  Vol:%.1f  Q:%d"):format(
-        icon, med, pct, status.volume or 1.0, status.queue or 0))
+    -- Two lines, each <=26 chars
+    print((" %s %-14s %3d%%"):format(icon, med, pct))
+    print((" Vol:%.1f  Q:%d"):format(status.volume or 1.0, status.queue or 0))
 end
 
 -- ────────────────────────────────────────────────────────────────────────────
@@ -158,26 +161,28 @@ end
 -- ────────────────────────────────────────────────────────────────────────────
 local function browseList(title, items, playerID, status)
     if #items == 0 then
-        clr(); header(title); print("  (nothing here yet)")
+        clr(); header(title); print(" (nothing here yet)")
         print(); print("Press any key..."); readCharTimeout(10); return nil
     end
-    local PAGE = 7
+    local PAGE = 6
     local page = 1
     while true do
         clr(); header(title)
         statusBar(status)
-        print("--------------------------------")
+        print(SEP)
         local s = (page-1)*PAGE+1
         local e = math.min(s+PAGE-1, #items)
         for i = s, e do
-            print(("  %d. %s"):format(i-s+1, items[i]))
+            -- truncate name to 22 chars so "N. " prefix fits in 26
+            local label = items[i]:sub(1,22)
+            print((" %d. %s"):format(i-s+1, label))
         end
-        print("--------------------------------")
+        print(SEP)
         local pages = math.ceil(#items/PAGE)
         if pages > 1 then
-            print(("  N=Next  B=Prev  (page %d/%d)"):format(page,pages))
+            print((" N=Next B=Prev %d/%d"):format(page,pages))
         end
-        print("  0=Back")
+        print(" 0=Back")
         print(); io.write("Select: ")
         local c = readCharTimeout(30)
         if not c or c == "0" then return nil
@@ -194,20 +199,20 @@ end
 -- Item action (play now / queue)
 -- ────────────────────────────────────────────────────────────────────────────
 local function itemAction(name, playerID)
-    clr(); header(name)
+    clr(); header(name:sub(1,24))
     print()
-    print("  1. Play Now")
-    print("  2. Add to Queue")
-    print("  0. Back")
+    print(" 1. Play Now")
+    print(" 2. Add to Queue")
+    print(" 0. Back")
     print(); io.write("Choice: ")
     local c = readCharTimeout(20)
     if c == "1" then
         local r = ask(playerID, {cmd="play_now", name=name, action="play"}, 3)
-        print(); print(r and "Sent: Play Now!" or "No response from player."); os.sleep(0.8)
+        print(); print(r and "Play Now sent!" or "No response."); os.sleep(0.8)
         return true
     elseif c == "2" then
         local r = ask(playerID, {cmd="queue_add", name=name, action="play"}, 3)
-        print(); print(r and ("Added. Queue: "..tostring(r.queue or "?")) or "No response."); os.sleep(0.8)
+        print(); print(r and ("Queued. Q:"..tostring(r.queue or "?")) or "No response."); os.sleep(0.8)
     end
     return false
 end
@@ -219,16 +224,16 @@ local function queueScreen(playerID, status)
     while true do
         clr(); header("Queue")
         statusBar(status)
-        print("--------------------------------")
+        print(SEP)
         local q = fetchQueue(playerID)
-        if #q == 0 then print("  Queue is empty.")
+        if #q == 0 then print(" (empty)")
         else
             for i, item in ipairs(q) do
-                print(("  %d. %s"):format(i, item.name))
+                print((" %d. %s"):format(i, item.name:sub(1,22)))
             end
         end
-        print("--------------------------------")
-        print("  C=Clear   0=Back")
+        print(SEP)
+        print(" C=Clear  0=Back")
         print(); io.write("Choice: ")
         local c = readCharTimeout(20)
         if not c or c == "0" then return
@@ -255,19 +260,19 @@ local function remoteMain(playerID)
     while true do
         local playing = status.state == "playing" or status.state == "paused"
 
-        clr(); header("Remote  ID:"..playerID)
+        clr(); header("Remote ID:"..playerID)
         statusBar(status)
-        print("================================")
-        print("  1. Browse Videos")
-        print("  2. Browse Audio")
-        print("  3. Queue")
-        print("  4. Refresh library")
-        print("--------------------------------")
+        print(SEP2)
+        print(" 1. Videos")
+        print(" 2. Audio")
+        print(" 3. Queue")
+        print(" 4. Refresh library")
+        print(SEP)
         if playing then
-            print("  P=Pause/Resume  S=Stop")
-            print("  +=Vol Up  -=Vol Down")
+            print(" P=Pause  S=Stop")
+            print(" +=Vol+  -=Vol-")
         end
-        print("  R=Refresh status  Q=Quit remote")
+        print(" R=Refresh  Q=Quit")
         print(); io.write("Choice: ")
 
         -- Wait for input; auto-refresh status after POLL_INTERVAL
