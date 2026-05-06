@@ -2,8 +2,13 @@
 local GITHUB_RAW = "https://raw.githubusercontent.com/ob-105/CC-tweaked-Audio-video-playback./main"
 local SELF_URL   = GITHUB_RAW .. "/player.lua"
 local SELF_PATH  = "player.lua"
-local VERSION    = "34"
+local VERSION    = "35"
 local BASE_URL   = GITHUB_RAW  -- set at startup; may be overridden by tunnel URL
+local REMOTE_PROTOCOL = "cct-media-ctrl"
+local _playQueue    = {}   -- {name=str, action=str} items queued by remote
+local _playerIndex  = {video={}, audio={}}  -- cached for remote queries during playback
+local _playerStatus = {state="startup", media=nil, frame=0, count=0, volume=1.0}
+local _remoteOpen   = false
 
 local function selfUpdate()
     print("[player] Checking for updates...")
@@ -545,19 +550,21 @@ local function preDownload(name, manifest)
     io.read()
 end
 
-local function mediaActionMenu(name)
+local function mediaActionMenu(name, handler)
     term.clear(); term.setCursorPos(1,1)
     print("=================================")
     print(("  %s"):format(name))
     print("=================================")
-    print("  1. Stream from GitHub  (rolling disk buffer)")
+    print("  1. Stream  (rolling disk buffer)")
     print("  2. Pre-download to disk, then play")
     print("  3. Upload to storage network, then play")
     print("  4. Play from storage network  (already uploaded)")
     print("---------------------------------")
     print("  0. Back"); print()
     io.write("Choice: ")
-    local n = tonumber(io.read())
+    local inp = readChar(handler)
+    if inp == "\1" then return "remote_play" end
+    local n = tonumber(inp)
     if n == 1 then return "play"
     elseif n == 2 then return "predownload"
     elseif n == 3 then return "upload_play"
@@ -619,22 +626,12 @@ local function playMedia(mon, speakers, name, manifest, store)
     local done    = {value = false}  -- video/audio finished naturally
     local paused  = {value = false}  -- P pressed: freeze
     local volume  = {value = 1.0}    -- 0.0-3.0; +/- to adjust
-    local REMOTE_PROTOCOL = "cct-media-ctrl"
     local framePeriod = 1 / fps
     local totalSecs   = count / fps
 
-    -- Open any wireless modems for remote control
-    local remoteOpen = false
-    for _, side in ipairs(peripheral.getNames()) do
-        local m = peripheral.wrap(side)
-        if m and m.isWireless and m.isWireless() then
-            pcall(rednet.open, side)
-            remoteOpen = true
-        end
-    end
-    if remoteOpen then
-        rednet.broadcast({cmd="announce", id=os.getComputerID(), media=name}, REMOTE_PROTOCOL)
-        print(("[remote] Wireless remote active. Player ID: %d"):format(os.getComputerID()))
+    -- Announce playback start to any listening remotes
+    if _remoteOpen then
+        rednet.broadcast({cmd="now_playing", id=os.getComputerID(), media=name}, REMOTE_PROTOCOL)
     end
 
     -- For network playback, pre-fetch audio from the store into memory so the
@@ -754,6 +751,11 @@ local function playMedia(mon, speakers, name, manifest, store)
             if stopped.value then break end
 
             renderIdx = frame
+            _playerStatus.state  = paused.value and "paused" or "playing"
+            _playerStatus.media  = name
+            _playerStatus.frame  = frame
+            _playerStatus.count  = count
+            _playerStatus.volume = volume.value
             local due     = (frame - 1) * framePeriod
             local elapsed = os.clock() - t0
             local frameData = nil
@@ -842,15 +844,38 @@ local function playMedia(mon, speakers, name, manifest, store)
                     volume.value = math.max(0.0, math.floor((volume.value - 0.2) * 10 + 0.5) / 10)
                 end
             elseif ev[1] == "rednet_message" then
-                local _, msg, protocol = ev[2], ev[3], ev[4]
+                local senderID, msg, protocol = ev[2], ev[3], ev[4]
                 if protocol == REMOTE_PROTOCOL and type(msg) == "table" then
                     local cmd = msg.cmd
                     if     cmd == "stop"         then doStop(); return
                     elseif cmd == "toggle_pause" then doTogglePause()
                     elseif cmd == "pause"        then paused.value = true
                     elseif cmd == "resume"       then paused.value = false; os.queueEvent("speaker_audio_empty")
-                    elseif cmd == "vol_up"       then volume.value = math.min(3.0, math.floor((volume.value + 0.2)*10+0.5)/10)
-                    elseif cmd == "vol_down"     then volume.value = math.max(0.0, math.floor((volume.value - 0.2)*10+0.5)/10)
+                    elseif cmd == "vol_up" then
+                        volume.value = math.min(3.0, math.floor((volume.value + 0.2)*10+0.5)/10)
+                        _playerStatus.volume = volume.value
+                    elseif cmd == "vol_down" then
+                        volume.value = math.max(0.0, math.floor((volume.value - 0.2)*10+0.5)/10)
+                        _playerStatus.volume = volume.value
+                    elseif cmd == "status" then
+                        rednet.send(senderID, {
+                            cmd="status_reply", state=_playerStatus.state,
+                            media=name, frame=_playerStatus.frame,
+                            count=count, volume=volume.value, queue=#_playQueue,
+                        }, REMOTE_PROTOCOL)
+                    elseif cmd == "list" then
+                        rednet.send(senderID, {
+                            cmd="list_reply",
+                            videos=_playerIndex.video, audio=_playerIndex.audio,
+                        }, REMOTE_PROTOCOL)
+                    elseif cmd == "queue_add" and type(msg.name)=="string" then
+                        table.insert(_playQueue, {name=msg.name, action=msg.action or "play"})
+                        rednet.send(senderID, {cmd="ok", queue=#_playQueue}, REMOTE_PROTOCOL)
+                    elseif cmd == "queue_list" then
+                        rednet.send(senderID, {cmd="queue_reply", queue=_playQueue}, REMOTE_PROTOCOL)
+                    elseif cmd == "queue_clear" then
+                        _playQueue = {}
+                        rednet.send(senderID, {cmd="ok"}, REMOTE_PROTOCOL)
                     end
                 end
             end
@@ -876,10 +901,30 @@ local function playMedia(mon, speakers, name, manifest, store)
     -- Clean up any leftover buffered frames (downloaded but not yet rendered)
     local mediaDir = "media/"..name
     if fs.exists(mediaDir) then fs.delete(mediaDir) end
-    print("\n[player] Done. Press Enter..."); io.read()
+    os.sleep(2)
 end
 
-local function drawMenu(title, items)
+-- Read one char from terminal, also dispatching rednet messages to handler.
+-- If handler(senderID, msg) returns non-nil, that value is returned immediately
+-- (used to inject remote commands into the menu as if the user typed them).
+local function readChar(handler)
+    while true do
+        local ev = {os.pullEvent()}
+        if ev[1] == "char" then
+            return ev[2]
+        elseif ev[1] == "key" and ev[2] == keys.enter then
+            return "\n"
+        elseif ev[1] == "rednet_message" then
+            local senderID, msg, protocol = ev[2], ev[3], ev[4]
+            if protocol == REMOTE_PROTOCOL and handler then
+                local r = handler(senderID, msg)
+                if r ~= nil then return r end
+            end
+        end
+    end
+end
+
+local function drawMenu(title, items, handler)
     term.clear(); term.setCursorPos(1,1)
     print("=================================")
     print("  CC:T Media Player  |  "..title)
@@ -888,31 +933,59 @@ local function drawMenu(title, items)
     else for i, n in ipairs(items) do print(("  %d. %s"):format(i, n)) end end
     print("---------------------------------"); print("  0. Back"); print()
     io.write("Select: ")
-    local n = tonumber(io.read())
+    local inp = readChar(handler)
+    if inp == "\1" then return "\1" end  -- remote_play sentinel: pass to caller
+    local n = tonumber(inp)
     if not n or n == 0 then return nil end
     return items[n]
 end
 
-local function mainMenu(idx)
+local function mainMenu(idx, handler)
     while true do
+        _playerStatus.state = "menu"
         term.clear(); term.setCursorPos(1,1)
         print("=================================")
         print("  CC:T Media Player")
         print("=================================")
         print(("  1. Videos  (%d available)"):format(#idx.video))
         print(("  2. Audio   (%d available)"):format(#idx.audio))
+        if #_playQueue > 0 then
+            print(("  3. Queue   (%d item(s) pending)"):format(#_playQueue))
+        end
         print("---------------------------------")
         print("  R. Refresh    Q. Quit"); print()
         io.write("Choice: ")
-        local inp = io.read()
-        if not inp then return "quit", nil end
+        local inp = readChar(handler)
+        if inp == "\1" then return "remote_play", nil end
         inp = inp:lower()
         if inp == "1" then
             if #idx.video == 0 then print("No videos yet."); os.sleep(1)
-            else local p = drawMenu("Videos", idx.video); if p then return "play", p end end
+            else
+                local p = drawMenu("Videos", idx.video, handler)
+                if p == "\1" then return "remote_play", nil end
+                if p then return "play", p end
+            end
         elseif inp == "2" then
             if #idx.audio == 0 then print("No audio yet."); os.sleep(1)
-            else local p = drawMenu("Audio", idx.audio); if p then return "play", p end end
+            else
+                local p = drawMenu("Audio", idx.audio, handler)
+                if p == "\1" then return "remote_play", nil end
+                if p then return "play", p end
+            end
+        elseif inp == "3" and #_playQueue > 0 then
+            term.clear(); term.setCursorPos(1,1)
+            print("=================================")
+            print("  Play Queue")
+            print("=================================")
+            for i, item in ipairs(_playQueue) do
+                print(("  %d. %s"):format(i, item.name))
+            end
+            print("---------------------------------")
+            print("  C. Clear queue   0. Back"); print()
+            io.write("Choice: ")
+            local qi = readChar(handler)
+            if qi == "\1" then return "remote_play", nil end
+            if qi:lower() == "c" then _playQueue = {} end
         elseif inp == "r" then return "refresh", nil
         elseif inp == "q" then return "quit", nil end
     end
@@ -948,38 +1021,107 @@ local function main()
     if #speakers == 0 then print("[warn] No speakers found. Audio disabled.")
     else print(("[player] Found %d speaker(s)."):format(#speakers)) end
     local mon = setupMonitor()
+    -- Open wireless modems for remote control (kept open for entire session)
+    for _, side in ipairs(peripheral.getNames()) do
+        local m = peripheral.wrap(side)
+        if m and m.isWireless and m.isWireless() then
+            pcall(rednet.open, side)
+            _remoteOpen = true
+        end
+    end
+    if _remoteOpen then
+        print(("[remote] Wireless remote enabled. Player ID: %d"):format(os.getComputerID()))
+        print("[remote] Run remote.lua on a pocket computer with wireless modem.")
+    end
     local idx = loadIndex()
+    _playerIndex = idx  -- expose to remote queries during playback
+
+    -- Remote command handler used while player is at the menu
+    local handleMenuRemote
+    handleMenuRemote = function(senderID, msg)
+        if type(msg) ~= "table" then return nil end
+        local cmd = msg.cmd
+        if cmd == "status" then
+            rednet.send(senderID, {
+                cmd="status_reply", state="menu",
+                queue=#_playQueue, queue_list=_playQueue,
+            }, REMOTE_PROTOCOL)
+        elseif cmd == "list" then
+            rednet.send(senderID, {
+                cmd="list_reply", videos=idx.video, audio=idx.audio,
+            }, REMOTE_PROTOCOL)
+        elseif cmd == "play_now" and type(msg.name)=="string" then
+            table.insert(_playQueue, 1, {name=msg.name, action=msg.action or "play"})
+            rednet.send(senderID, {cmd="ok"}, REMOTE_PROTOCOL)
+            return "\1"  -- sentinel: causes readChar to return it, triggering remote_play
+        elseif cmd == "queue_add" and type(msg.name)=="string" then
+            table.insert(_playQueue, {name=msg.name, action=msg.action or "play"})
+            rednet.send(senderID, {cmd="ok", queue=#_playQueue}, REMOTE_PROTOCOL)
+        elseif cmd == "queue_list" then
+            rednet.send(senderID, {cmd="queue_reply", queue=_playQueue}, REMOTE_PROTOCOL)
+        elseif cmd == "queue_clear" then
+            _playQueue = {}
+            rednet.send(senderID, {cmd="ok"}, REMOTE_PROTOCOL)
+        end
+        return nil
+    end
+
+    -- Helper: execute a play action (shared by local menu and queue drain)
+    local function playWithAction(name, manifest, action)
+        if action == "predownload" then
+            preDownload(name, manifest)
+            playMedia(mon, speakers, name, manifest, nil)
+        elseif action == "upload_play" then
+            local store = initStore()
+            if store then
+                uploadToNetwork(name, manifest, store)
+                playMedia(mon, speakers, name, manifest, store)
+            else
+                print("[error] Could not connect to storage network."); os.sleep(1)
+            end
+        elseif action == "network_play" then
+            local store = initStore()
+            if store then
+                playMedia(mon, speakers, name, manifest, store)
+            else
+                print("[error] Could not connect to storage network."); os.sleep(1)
+            end
+        else  -- "play" or any default: stream
+            playMedia(mon, speakers, name, manifest, nil)
+        end
+    end
+
     while true do
-        local action, pick = mainMenu(idx)
-        if action == "quit" then term.clear(); term.setCursorPos(1,1); print("Goodbye!"); return
-        elseif action == "refresh" then print("Refreshing..."); idx = loadIndex(); print("Done."); os.sleep(0.5)
+        -- Drain play queue before showing menu (filled by remote or local queue viewer)
+        while #_playQueue > 0 do
+            local item = table.remove(_playQueue, 1)
+            local ok, manifest = pcall(loadManifest, item.name)
+            if ok then
+                playWithAction(item.name, manifest, item.action or "play")
+            else
+                print("[error] Could not load '"..tostring(item.name).."': "..tostring(manifest))
+                os.sleep(1)
+            end
+        end
+
+        local action, pick = mainMenu(idx, handleMenuRemote)
+
+        if action == "quit" then
+            term.clear(); term.setCursorPos(1,1); print("Goodbye!"); return
+        elseif action == "refresh" then
+            print("Refreshing..."); idx = loadIndex(); _playerIndex = idx; print("Done."); os.sleep(0.5)
+        elseif action == "remote_play" then
+            -- _playQueue updated by handleMenuRemote; drain at top of loop
         elseif action == "play" and pick then
             local ok, manifest = pcall(loadManifest, pick)
-            if not ok then print("[error] "..tostring(manifest)); print("Press Enter..."); io.read()
+            if not ok then
+                print("[error] "..tostring(manifest)); os.sleep(1)
             else
-                local subaction = mediaActionMenu(pick)
-                if subaction == "predownload" then
-                    preDownload(pick, manifest)
-                    playMedia(mon, speakers, pick, manifest, nil)
-                elseif subaction == "upload_play" then
-                    local store = initStore()
-                    if store then
-                        uploadToNetwork(pick, manifest, store)
-                        playMedia(mon, speakers, pick, manifest, store)
-                    else
-                        print("[error] Could not connect to storage network.")
-                        print("Press Enter..."); io.read()
-                    end
-                elseif subaction == "network_play" then
-                    local store = initStore()
-                    if store then
-                        playMedia(mon, speakers, pick, manifest, store)
-                    else
-                        print("[error] Could not connect to storage network.")
-                        print("Press Enter..."); io.read()
-                    end
-                elseif subaction == "play" then
-                    playMedia(mon, speakers, pick, manifest, nil)
+                local subaction = mediaActionMenu(pick, handleMenuRemote)
+                if subaction == "remote_play" then
+                    -- Remote sent play_now while user was in action menu; queue drains next iteration
+                elseif subaction then
+                    playWithAction(pick, manifest, subaction)
                 end
             end
         end
