@@ -2,7 +2,7 @@
 local GITHUB_RAW = "https://raw.githubusercontent.com/ob-105/CC-tweaked-Audio-video-playback./main"
 local SELF_URL   = GITHUB_RAW .. "/player.lua"
 local SELF_PATH  = "player.lua"
-local VERSION    = "28"
+local VERSION    = "29"
 local BASE_URL   = GITHUB_RAW  -- set at startup; may be overridden by tunnel URL
 
 local function selfUpdate()
@@ -615,19 +615,74 @@ local function playMedia(mon, speakers, name, manifest, store)
     -- naturally: prefetcher fetches while renderer is sleeping for frame timing.
     local prefetchBuf = {}
     local renderIdx   = 0      -- frame the renderer is currently waiting for
-    local NET_AHEAD   = 4      -- how many frames to fetch ahead
+    local NET_AHEAD   = store and 4 or 12  -- prefetch window (larger for parallel HTTP)
 
     local function prefetchLoop()
-        if not store then return end
-        for i = 1, count do
-            -- Throttle: don't race more than NET_AHEAD frames ahead of the renderer
-            while i > renderIdx + NET_AHEAD do
-                os.sleep(0)  -- yield to renderer / audio coroutines
+        if store then
+            -- Sequential store.get() for storage-network playback
+            for i = 1, count do
+                while i > renderIdx + NET_AHEAD do os.sleep(0) end
+                if prefetchBuf[i] == nil then
+                    local key  = ("media/%s/frames/%06d"):format(name, i)
+                    local data = store.get(key)
+                    prefetchBuf[i] = data or false
+                end
             end
-            if prefetchBuf[i] == nil then
-                local key  = ("media/%s/frames/%06d"):format(name, i)
-                local data = store.get(key)
-                prefetchBuf[i] = data or false
+        else
+            -- Parallel async HTTP (or instant disk read if already pre-downloaded)
+            local inFlight  = {}   -- url -> frame index
+            local nextFetch = 1
+            local HTTP_PAR  = 6    -- max concurrent HTTP requests
+            local function flightCount()
+                local n = 0; for _ in pairs(inFlight) do n = n + 1 end; return n
+            end
+            while nextFetch <= count or next(inFlight) ~= nil do
+                -- Fire off HTTP requests or read disk up to limits
+                while nextFetch <= count
+                      and nextFetch <= renderIdx + NET_AHEAD
+                      and flightCount() < HTTP_PAR do
+                    local p = framePath(nextFetch)
+                    if fs.exists(p) then
+                        -- Pre-downloaded: read directly into buffer, no HTTP needed
+                        local fh = fs.open(p, "r")
+                        prefetchBuf[nextFetch] = fh and fh.readAll() or false
+                        if fh then fh.close() end
+                        nextFetch = nextFetch + 1
+                    else
+                        -- Stream: fire async HTTP request
+                        local url = frameURL(nextFetch)
+                        http.request(url, nil, nil, true)
+                        inFlight[url] = nextFetch
+                        nextFetch = nextFetch + 1
+                    end
+                end
+                if next(inFlight) ~= nil then
+                    -- Collect whichever HTTP response arrives next
+                    local ev = {os.pullEvent()}
+                    local evType = ev[1]
+                    if evType == "http_success" then
+                        local url, resp = ev[2], ev[3]
+                        local idx = inFlight[url]
+                        if idx then
+                            prefetchBuf[idx] = resp.readAll()
+                            resp.close()
+                            inFlight[url] = nil
+                        elseif resp then resp.close() end
+                    elseif evType == "http_failure" then
+                        local url = ev[2]
+                        local idx = inFlight[url]
+                        if idx then
+                            prefetchBuf[idx] = false
+                            inFlight[url] = nil
+                        end
+                    end
+                    -- Other events (timer, speaker_audio_empty, etc.) are broadcast
+                    -- to all coroutines by parallel.waitForAll — no action needed here
+                elseif nextFetch > count then
+                    break   -- all frames dispatched, no in-flight requests
+                else
+                    os.sleep(0)  -- waiting for renderIdx to advance; yield
+                end
             end
         end
     end
@@ -639,40 +694,17 @@ local function playMedia(mon, speakers, name, manifest, store)
             local elapsed = os.clock() - t0
             local frameData = nil
 
-            if store then
-                -- Wait for the prefetcher to deliver this frame.
-                -- Give it up to 2× the frame period before declaring it late.
-                local giveUp = os.clock() + framePeriod * 2
-                while prefetchBuf[frame] == nil and os.clock() < giveUp do
-                    os.sleep(0)  -- yield so prefetcher can run
-                end
-                local fd = prefetchBuf[frame]
-                prefetchBuf[frame] = nil  -- release memory immediately
-                if fd then
-                    frameData = fd
-                else
-                    stats.dlFailed = stats.dlFailed + 1
-                end
+            -- Wait for prefetcher to deliver this frame (works for both store and HTTP paths)
+            local giveUp = os.clock() + framePeriod * 2
+            while prefetchBuf[frame] == nil and os.clock() < giveUp do
+                os.sleep(0)
+            end
+            local fd = prefetchBuf[frame]
+            prefetchBuf[frame] = nil  -- release memory immediately
+            if fd then
+                frameData = fd
             else
-                -- Download to local disk (original streaming path)
-                local p = framePath(frame)
-                if not fs.exists(p) then
-                    local dlT0 = os.clock()
-                    local ok   = download(frameURL(frame), p)
-                    local dlMs = math.floor((os.clock() - dlT0) * 1000)
-                    if not ok then
-                        stats.dlFailed = stats.dlFailed + 1
-                        print(("\n[warn] Frame %d download FAILED"):format(frame))
-                    elseif dlMs > framePeriod * 1000 then
-                        stats.dlSlow = stats.dlSlow + 1
-                        print(("\n[warn] Frame %d download slow (%dms, budget %dms)"):format(
-                            frame, dlMs, math.floor(framePeriod * 1000)))
-                    end
-                end
-                if fs.exists(p) then
-                    local fh = fs.open(p, "r")
-                    if fh then frameData = fh.readAll(); fh.close() end
-                end
+                stats.dlFailed = stats.dlFailed + 1
             end
 
             -- Live status line (overwrites itself)
@@ -697,16 +729,6 @@ local function playMedia(mon, speakers, name, manifest, store)
                 end
             else
                 stats.skipped = stats.skipped + 1
-            end
-
-            if not store then
-                -- Local disk: delete rendered frame and pre-fetch lookahead
-                local p = framePath(frame)
-                if fs.exists(p) then fs.delete(p) end
-                local nx = frame + FRAME_BUFFER
-                if nx <= count and fs.getFreeSpace("/") > 400 * 1024 then
-                    download(frameURL(nx), framePath(nx))
-                end
             end
         end
         print()  -- newline after the final status line
