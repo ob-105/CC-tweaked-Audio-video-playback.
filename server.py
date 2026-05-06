@@ -99,12 +99,28 @@ def _make_flask_app(base_dir):
 
     @app.route("/screenshare/frame")
     def serve_ss_frame():
+        from flask import request as _req, abort, Response as _Resp
+        # Client can request a specific resolution via ?w=N&h=N
+        try:
+            w = int(_req.args.get("w", _ss_w))
+            h = int(_req.args.get("h", _ss_h))
+            w = max(1, min(w, 512))
+            h = max(1, min(h, 512))
+        except (ValueError, TypeError):
+            w, h = _ss_w, _ss_h
         with _ss_lock:
-            data = _ss_frame
-        if not data:
-            from flask import abort
+            raw = _ss_frame
+        if not raw:
             abort(503)
-        from flask import Response as _Resp
+        # Re-encode at requested resolution if it differs from cached size
+        if w != _ss_w or h != _ss_h:
+            try:
+                img   = _ss_grab()
+                data  = _ss_encode(img, w, h)
+            except Exception:
+                abort(503)
+        else:
+            data = raw
         return _Resp(data, mimetype="text/plain; charset=ascii")
 
     @app.route("/screenshare/info")

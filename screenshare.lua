@@ -88,7 +88,7 @@ local frameCount = 0
 local startTime  = os.epoch("utc")
 local lastFPS    = -1
 local errors     = 0
-local URL        = BASE .. "/screenshare/frame"
+local URL = BASE .. "/screenshare/frame?w=" .. mW .. "&h=" .. (mH * 2)
 
 while true do
     local res, err = http.get(URL)
