@@ -2,7 +2,7 @@
 local GITHUB_RAW = "https://raw.githubusercontent.com/ob-105/CC-tweaked-Audio-video-playback./main"
 local SELF_URL   = GITHUB_RAW .. "/player.lua"
 local SELF_PATH  = "player.lua"
-local VERSION    = "35"
+local VERSION    = "36"
 local BASE_URL   = GITHUB_RAW  -- set at startup; may be overridden by tunnel URL
 local REMOTE_PROTOCOL = "cct-media-ctrl"
 local _playQueue    = {}   -- {name=str, action=str} items queued by remote
@@ -550,6 +550,26 @@ local function preDownload(name, manifest)
     io.read()
 end
 
+-- Read one char from terminal, also dispatching rednet messages to handler.
+-- If handler(senderID, msg) returns non-nil, that value is returned immediately
+-- (used to inject remote commands into the menu as if the user typed them).
+local function readChar(handler)
+    while true do
+        local ev = {os.pullEvent()}
+        if ev[1] == "char" then
+            return ev[2]
+        elseif ev[1] == "key" and ev[2] == keys.enter then
+            return "\n"
+        elseif ev[1] == "rednet_message" then
+            local senderID, msg, protocol = ev[2], ev[3], ev[4]
+            if protocol == REMOTE_PROTOCOL and handler then
+                local r = handler(senderID, msg)
+                if r ~= nil then return r end
+            end
+        end
+    end
+end
+
 local function mediaActionMenu(name, handler)
     term.clear(); term.setCursorPos(1,1)
     print("=================================")
@@ -902,26 +922,6 @@ local function playMedia(mon, speakers, name, manifest, store)
     local mediaDir = "media/"..name
     if fs.exists(mediaDir) then fs.delete(mediaDir) end
     os.sleep(2)
-end
-
--- Read one char from terminal, also dispatching rednet messages to handler.
--- If handler(senderID, msg) returns non-nil, that value is returned immediately
--- (used to inject remote commands into the menu as if the user typed them).
-local function readChar(handler)
-    while true do
-        local ev = {os.pullEvent()}
-        if ev[1] == "char" then
-            return ev[2]
-        elseif ev[1] == "key" and ev[2] == keys.enter then
-            return "\n"
-        elseif ev[1] == "rednet_message" then
-            local senderID, msg, protocol = ev[2], ev[3], ev[4]
-            if protocol == REMOTE_PROTOCOL and handler then
-                local r = handler(senderID, msg)
-                if r ~= nil then return r end
-            end
-        end
-    end
 end
 
 local function drawMenu(title, items, handler)
